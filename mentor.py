@@ -10,6 +10,7 @@ import sys
 from agents.brain import ask
 from agents.auditor import audit as run_audit
 from agents.detective import detect as run_detect
+from agents.scribe import scribe as run_scribe
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -174,6 +175,10 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
     elif skill["name"] == "Detect":
         write = prompt("Write Build-Depends to debian/control? [y/N]:").lower() == "y"
         result = run_detect(target, write=write)
+    elif skill["name"] == "Scribe":
+        release = prompt("Target release name [noble]:") or "noble"
+        write   = prompt("Prepend entry to debian/changelog? [y/N]:").lower() == "y"
+        result  = run_scribe(target, release=release, write=write)
     else:
         result = skill["mock_result"]
 
@@ -202,6 +207,14 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                     print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
             else:
                 print(c(YELLOW, "\nNo external dependencies detected."))
+        elif skill["name"] == "Scribe" and result.get("data"):
+            print(c(CYAN, "\n── Generated debian/changelog entry ────────────────"))
+            print(result["data"].strip())
+            print(c(CYAN, "────────────────────────────────────────────────────"))
+            if result.get("written_to"):
+                print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+            else:
+                print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
         else:
             print(json.dumps(result, indent=2))
 
