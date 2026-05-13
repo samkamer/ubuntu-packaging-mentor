@@ -134,6 +134,116 @@ def prompt(msg: str) -> str:
         sys.exit(0)
 
 
+# ── Persona-aware LLM narration ────────────────────────────────────────────────
+
+# Per-skill, per-touchpoint prompts fed to the persona's system_prompt
+_EXPLAIN_PROMPTS = {
+    "pre_skill": {
+        "Audit": (
+            "The user is about to run the Audit skill on a source package directory.\n"
+            "The tool will run licensecheck, parse every source file's license and "
+            "copyright holder, then use AI to produce a DEP-5 debian/copyright file.\n"
+            "Explain this process and its importance in Ubuntu/Debian packaging."
+        ),
+        "Detect": (
+            "The user is about to run the Detect skill on a source package directory.\n"
+            "The tool scans C/C++ headers, Python imports, Go modules, and autoconf "
+            "macros to build a list of Ubuntu Build-Depends packages for debian/control.\n"
+            "Explain what Build-Depends is, why it matters, and what this tool does."
+        ),
+        "Scribe": (
+            "The user is about to run the Scribe skill on a source package directory.\n"
+            "The tool reads git commit history and uses AI to write a properly formatted "
+            "debian/changelog entry with the correct stanza structure.\n"
+            "Explain the debian/changelog format and why it matters for packaging."
+        ),
+    },
+    "before_write": {
+        "Audit": (
+            "The Audit agent has finished generating a DEP-5 debian/copyright file.\n"
+            "The user is about to decide whether to save it to debian/copyright.\n"
+            "Explain what this file is for, what they should review before saving, "
+            "and any common mistakes to watch out for."
+        ),
+        "Detect": (
+            "The Detect agent has finished generating a Build-Depends list for debian/control.\n"
+            "The user is about to decide whether to save it.\n"
+            "Explain what Build-Depends does at build time, what they should verify "
+            "in the list before saving, and any common pitfalls."
+        ),
+        "Scribe": (
+            "The Scribe agent has finished generating a debian/changelog entry.\n"
+            "The user is about to decide whether to prepend it to debian/changelog.\n"
+            "Explain the changelog format rules, what to review, and why the trailer "
+            "line format must be exact."
+        ),
+    },
+    "post_result": {
+        "Audit": (
+            "The Audit agent has generated the DEP-5 debian/copyright file shown above.\n"
+            "Explain what the user should review in this file, what the key sections mean, "
+            "and what their next packaging step should be."
+        ),
+        "Detect": (
+            "The Detect agent has produced the Build-Depends list shown above.\n"
+            "Explain what the user should verify in this list, what each type of package "
+            "does at build time, and what their next packaging step should be."
+        ),
+        "Scribe": (
+            "The Scribe agent has written the debian/changelog entry shown above.\n"
+            "Explain what the user should review in this entry, whether the version and "
+            "release look correct, and what their next packaging step should be."
+        ),
+    },
+    "on_error": {
+        "Audit": "The Audit agent reported an error running licensecheck on the package source.",
+        "Detect": "The Detect agent reported an error scanning for Build-Depends.",
+        "Scribe": "The Scribe agent reported an error generating the changelog entry.",
+    },
+}
+
+# CoreDev post-result one-liners (no LLM call needed)
+_COREDEV_SUMMARY = {
+    "Audit":  lambda r: f"debian/copyright generated ({len(r.get('data','').splitlines())} lines).",
+    "Detect": lambda r: f"{len(r.get('dependencies', []))} Build-Depends resolved.",
+    "Scribe": lambda r: "changelog entry drafted.",
+}
+
+
+def _show_write_status(result: dict) -> None:
+    """Print written_to / backed_up / not-written messages."""
+    if result.get("written_to"):
+        print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+        if result.get("backed_up"):
+            print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
+    else:
+        print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
+
+
+def _persona_explain(touchpoint: str, skill_name: str, persona: dict,
+                     extra: str = "", label: str = "Thinking") -> None:
+    """
+    Emit a persona-appropriate LLM explanation at a named touchpoint.
+
+    CoreDev: skipped entirely — no LLM call, no output.
+    MOTU/Beginner: calls ask() with the touchpoint prompt + persona system_prompt.
+    extra: appended to the prompt (e.g. error text or result summary).
+    """
+    if persona["name"] == "CoreDev":
+        return
+
+    base = _EXPLAIN_PROMPTS.get(touchpoint, {}).get(skill_name, "")
+    if not base:
+        return
+
+    context = base + (f"\n\nAdditional context: {extra}" if extra else "")
+    try:
+        text = ask(persona["system_prompt"], context, label=label)
+        print(f"\n{c(GREEN, '[' + persona['name'] + ']')} {text.strip()}\n")
+    except RuntimeError:
+        pass  # explanations are non-fatal
+
+
 # ── Persona selector ───────────────────────────────────────────────────────────
 
 def select_persona() -> dict:
@@ -152,79 +262,86 @@ def select_persona() -> dict:
 # ── Skill runner ───────────────────────────────────────────────────────────────
 
 def run_skill(skill: dict, target: str, persona: dict) -> None:
-    print(f"\n{c(CYAN, '▶')} {c(BOLD, skill['name'])} on {c(YELLOW, target)}")
+    sname = skill["name"]
+    print(f"\n{c(CYAN, '▶')} {c(BOLD, sname)} on {c(YELLOW, target)}")
 
-    # Step 1: ask Gemma to explain what this skill does for the chosen persona
-    print(c(CYAN, "\n[Mentor] Asking Gemma for context..."))
-    user_prompt = (
-        f"Packaging task: {skill['name']}\n"
-        f"Description: {skill['description']}\n"
-        f"Target directory: {target}"
-    )
-    try:
-        explanation = ask(persona["system_prompt"], user_prompt, label=f"Asking AI: {skill['name']}")
-        print(f"\n{c(GREEN, '[' + persona['name'] + ']')} {explanation.strip()}\n")
-    except RuntimeError as e:
-        print(c(RED, f"  [brain] {e}"))
+    # ── Touchpoint 1: pre-skill explanation ────────────────────────────────────
+    # CoreDev: skipped.  MOTU: policy refs.  Beginner: full concept explanation.
+    _persona_explain("pre_skill", sname, persona, label=f"{sname}: context")
 
-    # Step 2: invoke real agent or fall back to mock
+    # ── Touchpoint 2: before-write prompt ──────────────────────────────────────
+    # Shown BEFORE asking the user whether to save — explains what the file does.
     is_beginner = persona["name"] == "Beginner"
-    print(c(CYAN, "Calling Agent..."))
-    if skill["name"] == "Audit":
-        write = prompt("Write debian/copyright to target directory? [y/N]:").lower() == "y"
+    is_coredev  = persona["name"] == "CoreDev"
+    print(c(CYAN, "\nCalling Agent..."))
+
+    if sname == "Audit":
+        _persona_explain("before_write", sname, persona, label="Audit: before save")
+        write  = prompt("Write debian/copyright to target directory? [y/N]:").lower() == "y"
         result = run_audit(target, write=write, backup=is_beginner)
-    elif skill["name"] == "Detect":
-        write = prompt("Write Build-Depends to debian/control? [y/N]:").lower() == "y"
+
+    elif sname == "Detect":
+        _persona_explain("before_write", sname, persona, label="Detect: before save")
+        write  = prompt("Write Build-Depends to debian/control? [y/N]:").lower() == "y"
         result = run_detect(target, write=write, backup=is_beginner)
-    elif skill["name"] == "Scribe":
+
+    elif sname == "Scribe":
+        _persona_explain("before_write", sname, persona, label="Scribe: before save")
         release = prompt("Target release name [noble]:") or "noble"
         write   = prompt("Prepend entry to debian/changelog? [y/N]:").lower() == "y"
         result  = run_scribe(target, release=release, write=write, backup=is_beginner)
+
     else:
         result = skill["mock_result"]
 
-    # Surface errors clearly
+    # ── Error path ─────────────────────────────────────────────────────────────
     if result.get("status") == "error":
-        print(c(RED, f"\n[Error] {result.get('error')}"))
-    else:
-        print(c(GREEN, "\n[Result]"))
-        if skill["name"] == "Audit" and result.get("data"):
-            print(c(CYAN, "\n── Generated debian/copyright ──────────────────────"))
-            print(result["data"].strip())
-            print(c(CYAN, "────────────────────────────────────────────────────"))
-            if result.get("written_to"):
-                print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
-                if result.get("backed_up"):
-                    print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
-            else:
-                print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
-        elif skill["name"] == "Detect" and result.get("dependencies") is not None:
-            deps = result["dependencies"]
-            if deps:
-                print(c(CYAN, "\n── Suggested Build-Depends ─────────────────────────"))
-                print("Build-Depends: " + ",\n               ".join(deps))
-                print(c(CYAN, "────────────────────────────────────────────────────"))
-                if result.get("written_to"):
-                    print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
-                    if result.get("backed_up"):
-                        print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
-                else:
-                    print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
-            else:
-                print(c(YELLOW, "\nNo external dependencies detected."))
-        elif skill["name"] == "Scribe" and result.get("data"):
-            print(c(CYAN, "\n── Generated debian/changelog entry ────────────────"))
-            print(result["data"].strip())
-            print(c(CYAN, "────────────────────────────────────────────────────"))
-            if result.get("written_to"):
-                print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
-                if result.get("backed_up"):
-                    print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
+        err = result.get("error", "Unknown error")
+        print(c(RED, f"\n[Error] {err}"))
+        # Touchpoint 3a: on-error explanation
+        # Beginner/MOTU get LLM guidance; CoreDev sees the raw message only.
+        _persona_explain("on_error", sname, persona, extra=err, label="Error: guidance")
+        return
 
-            else:
-                print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
+    # ── Success path ───────────────────────────────────────────────────────────
+    print(c(GREEN, "\n[Result]"))
+
+    if sname == "Audit" and result.get("data"):
+        print(c(CYAN, "\n── Generated debian/copyright ──────────────────────"))
+        print(result["data"].strip())
+        print(c(CYAN, "────────────────────────────────────────────────────"))
+        _show_write_status(result)
+        if is_coredev:
+            print(c(CYAN, f"  {_COREDEV_SUMMARY['Audit'](result)}"))
+
+    elif sname == "Detect" and result.get("dependencies") is not None:
+        deps = result["dependencies"]
+        if deps:
+            print(c(CYAN, "\n── Suggested Build-Depends ─────────────────────────"))
+            print("Build-Depends: " + ",\n               ".join(deps))
+            print(c(CYAN, "────────────────────────────────────────────────────"))
+            _show_write_status(result)
+            if is_coredev:
+                print(c(CYAN, f"  {_COREDEV_SUMMARY['Detect'](result)}"))
         else:
-            print(json.dumps(result, indent=2))
+            print(c(YELLOW, "\nNo external dependencies detected."))
+
+    elif sname == "Scribe" and result.get("data"):
+        print(c(CYAN, "\n── Generated debian/changelog entry ────────────────"))
+        print(result["data"].strip())
+        print(c(CYAN, "────────────────────────────────────────────────────"))
+        _show_write_status(result)
+        if is_coredev:
+            print(c(CYAN, f"  Scribe: {_COREDEV_SUMMARY['Scribe'](result)}"))
+
+    else:
+        print(json.dumps(result, indent=2))
+
+    # ── Touchpoint 3b: post-result explanation ─────────────────────────────────
+    # Beginner: what results mean + next steps.
+    # MOTU: compliance notes + next step.
+    # CoreDev: skipped.
+    _persona_explain("post_result", sname, persona, label=f"{sname}: next steps")
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
