@@ -50,6 +50,26 @@ else:
     OLLAMA_URL = None
     MODEL      = None
 
+# ── LLM budget ────────────────────────────────────────────────────────────────
+
+_DEFAULT_BUDGET = 180  # seconds
+
+def llm_budget_seconds() -> float:
+    """
+    Return the LLM budget in seconds for per-item calls across all agents.
+
+    Reads the LLM_BUDGET environment variable (integer seconds).
+    Defaults to 180 s (3 minutes).
+
+    Example:
+        LLM_BUDGET=600 python3 mentor.py    # 10-minute budget for large packages
+    """
+    raw = os.environ.get("LLM_BUDGET", "").strip()
+    if raw.isdigit():
+        return float(raw)
+    return float(_DEFAULT_BUDGET)
+
+
 # ── Spinner ───────────────────────────────────────────────────────────────────
 
 class Spinner:

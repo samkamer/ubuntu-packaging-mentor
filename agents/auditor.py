@@ -29,7 +29,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask
+from agents.brain import ask, llm_budget_seconds
 
 # ── DEP-5 / SPDX known identifiers ───────────────────────────────────────────
 
@@ -47,7 +47,7 @@ VALID_DEP5_IDS = {
 }
 
 LLM_TIMEOUT_PER_CALL = 15    # seconds per individual license-normalization call
-LLM_BUDGET_SECONDS   = 180   # total LLM budget for the whole audit run
+LLM_BUDGET_SECONDS   = None  # resolved at call time from LLM_BUDGET env var
 
 
 def _is_valid_dep5(identifier: str) -> bool:
@@ -284,7 +284,9 @@ def audit(source_dir: str, write: bool = False) -> dict:
                 "error": "No license/copyright information found in source tree."}
 
     print(f"  [*] Found {len(entries)} file(s). Resolving license identifiers ...", file=sys.stderr)
-    llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
+    budget = llm_budget_seconds()
+    print(f"  [*] LLM budget: {int(budget)}s (set LLM_BUDGET env var to change)", file=sys.stderr)
+    llm_budget = {"remaining": budget}
     groups = group_by_license(entries, llm_budget)
 
     dep5_text = build_dep5(groups, source_name)

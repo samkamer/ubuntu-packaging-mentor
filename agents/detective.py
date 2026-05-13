@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask
+from agents.brain import ask, llm_budget_seconds
 
 # ── Language detection / scanning ─────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ _SYSTEM_PROMPT = (
 )
 
 LLM_TIMEOUT_PER_CALL = 15
-LLM_BUDGET_SECONDS   = 180
+LLM_BUDGET_SECONDS   = None  # resolved at call time from LLM_BUDGET env var
 
 
 def _regex_best_candidate(candidates: list[str]) -> str | None:
@@ -524,9 +524,10 @@ def detect(source_dir: str, write: bool = False) -> dict:
         return {"status": "success", "dependencies": [], "agent": "detective",
                 "note": "No external dependencies found in source tree."}
 
-    # Phase 2: per-item LLM calls (15s each, 3-min total budget)
-    print(f"  [*] Phase 2: asking AI per dependency ({total_items} items) ...", file=sys.stderr)
-    llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
+    # Phase 2: per-item LLM calls (15s each, budget from LLM_BUDGET env var)
+    budget = llm_budget_seconds()
+    print(f"  [*] Phase 2: asking AI per dependency ({total_items} items, budget: {int(budget)}s) ...", file=sys.stderr)
+    llm_budget = {"remaining": budget}
     raw_deps = resolve_with_llm(c_results, py_results, go_modules, ac_results, llm_budget)
 
     # Add build system tools directly (no LLM needed — deterministic)
