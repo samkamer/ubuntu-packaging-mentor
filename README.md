@@ -30,33 +30,12 @@ asciinema play demo/demo_personas.cast
 
 ### patch_manager — Quilt Patch Workflow
 
-```
-source tree scan → LLM identifies file → LLM generates diff
-→ quilt new → quilt add → patch -p1 → quilt refresh
-```
-
 ```bash
 # Dry run — preview the diff without touching files
 python3 agents/patch_manager.py <source_dir> <patch-name> "<description>" --dry-run
 
 # Apply for real
 python3 agents/patch_manager.py <source_dir> <patch-name> "<description>"
-
-# Example
-python3 agents/patch_manager.py lab/sources/hello-package/hello-2.10 \
-  fix-null-check "Add null pointer check before dereferencing name argument"
-```
-
-Output JSON:
-```json
-{
-  "status": "success",
-  "patch": "fix-null-check.patch",
-  "file": "src/hello.c",
-  "patch_path": "debian/patches/fix-null-check.patch",
-  "written_to": "/path/to/source/debian/patches/fix-null-check.patch",
-  "agent": "patch_manager"
-}
 ```
 
 Requires `quilt` and `patch`: `sudo apt install quilt patch`
