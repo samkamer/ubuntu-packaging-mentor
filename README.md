@@ -21,11 +21,45 @@ asciinema play demo/demo_personas.cast
 
 ## Agents
 
-| Agent | What it does |
-|-------|-------------|
-| **auditor** | Scans source tree with `licensecheck`, builds a DEP-5 `debian/copyright` |
-| **detective** | Scans C headers + autoconf/CMake macros → generates `Build-Depends` |
-| **scribe** | Reads git log → drafts a `debian/changelog` entry |
+| Agent | Skill # | What it does |
+|-------|---------|-------------|
+| **auditor** | 1 — Audit | Scans source tree with `licensecheck`, builds a DEP-5 `debian/copyright` |
+| **detective** | 2 — Detect | Scans C headers + autoconf/CMake macros → generates `Build-Depends` |
+| **scribe** | 3 — Scribe | Reads git log → drafts a `debian/changelog` entry |
+| **patch_manager** | 4 — Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
+
+### patch_manager — Quilt Patch Workflow
+
+```
+source tree scan → LLM identifies file → LLM generates diff
+→ quilt new → quilt add → patch -p1 → quilt refresh
+```
+
+```bash
+# Dry run — preview the diff without touching files
+python3 agents/patch_manager.py <source_dir> <patch-name> "<description>" --dry-run
+
+# Apply for real
+python3 agents/patch_manager.py <source_dir> <patch-name> "<description>"
+
+# Example
+python3 agents/patch_manager.py lab/sources/hello-package/hello-2.10 \
+  fix-null-check "Add null pointer check before dereferencing name argument"
+```
+
+Output JSON:
+```json
+{
+  "status": "success",
+  "patch": "fix-null-check.patch",
+  "file": "src/hello.c",
+  "patch_path": "debian/patches/fix-null-check.patch",
+  "written_to": "/path/to/source/debian/patches/fix-null-check.patch",
+  "agent": "patch_manager"
+}
+```
+
+Requires `quilt` and `patch`: `sudo apt install quilt patch`
 
 ## Persona levels
 
