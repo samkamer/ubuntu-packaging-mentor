@@ -22,12 +22,12 @@ asciinema play demo/demo_personas.cast
 ## Agents
 
 | Agent | Skill | What it does |
-|-------|-------|-------------|
-| **auditor** | 1 Audit | Scans source tree with `licensecheck`, builds a DEP-5 `debian/copyright` |
-| **detective** | 2 Detect | Scans C headers + autoconf/CMake macros → generates `Build-Depends` |
-| **scribe** | 3 Scribe | Reads git log → drafts a `debian/changelog` entry |
-| **patch_manager** | 4 Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
-| **builder** | 5 Build | Runs `debuild -us -uc -b`; on failure uses AI to classify the error and recommend the recovery agent |
+|-------|------------|-------------|
+| **auditor** | 1&nbsp;Audit | Scans source tree with `licensecheck`, builds a DEP-5 `debian/copyright` |
+| **detective** | 2&nbsp;Detect | Scans C headers + autoconf/CMake macros → generates `Build-Depends` |
+| **scribe** | 3&nbsp;Scribe | Reads git log → drafts a `debian/changelog` entry |
+| **patch_manager** | 4&nbsp;Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
+| **builder** | 5&nbsp;Build | Runs `debuild -us -uc -b`; on failure uses AI to classify the error and recommend the recovery agent |
 
 ---
 
