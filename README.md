@@ -5,19 +5,17 @@ adaptive explanations tailored to your experience level.
 
 ---
 
-## Demo — Full Workflow (Beginner)
+## Demos
 
-Audit → Detect → Scribe in a single session:
+Replay locally with:
 
-<img src="demo/demo.svg" alt="Full workflow demo" width="900"/>
+```bash
+# Full workflow (Beginner: Audit → Detect → Scribe)
+asciinema play demo/demo.cast
 
----
-
-## Demo — Persona Contrast
-
-Same tools, different depth: Beginner · MOTU · CoreDev
-
-<img src="demo/demo_personas.svg" alt="Persona contrast demo" width="900"/>
+# Persona contrast (Beginner · MOTU · CoreDev)
+asciinema play demo/demo_personas.cast
+```
 
 ---
 
