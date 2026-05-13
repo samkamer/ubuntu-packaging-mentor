@@ -128,6 +128,120 @@ def scan_build_system(source_dir: str) -> list[str]:
     return sorted(set(tools))
 
 
+# Autoconf macros that indicate library dependencies
+_PKG_CHECK   = re.compile(r'PKG_CHECK_MODULES\s*\(\s*\[?[\w_]+\]?\s*,\s*\[?([^\],\)\n]+)', re.IGNORECASE)
+_CHECK_LIB   = re.compile(r'AC_CHECK_LIB\s*\(\s*\[?([a-zA-Z0-9_\-\.]+)\]?', re.IGNORECASE)
+_SEARCH_LIBS = re.compile(r'AC_SEARCH_LIBS\s*\(\s*\[?[\w_]+\]?\s*,\s*\[?([^\]>\)\n]+)', re.IGNORECASE)
+# CMake find_package / pkg_check_modules
+_CMAKE_FIND  = re.compile(r'find_package\s*\(\s*([A-Za-z0-9_\-]+)', re.IGNORECASE)
+_CMAKE_PKG   = re.compile(r'pkg_check_modules\s*\(\s*\S+\s+(?:REQUIRED\s+)?([A-Za-z0-9_\-]+)', re.IGNORECASE)
+
+
+def scan_autoconf_deps(source_dir: str) -> dict[str, list[str]]:
+    """
+    Parse configure.ac (autoconf) or CMakeLists.txt for explicit library checks.
+
+    Extracts PKG_CHECK_MODULES, AC_CHECK_LIB, AC_SEARCH_LIBS, find_package
+    macros and resolves them to apt package candidates via apt-file.
+
+    Returns a dict mapping description string → list[str] of apt candidates.
+    """
+    results: dict[str, list[str]] = {}
+
+    # ── autoconf ──────────────────────────────────────────────────────────────
+    for acname in ("configure.ac", "configure.in"):
+        acpath = os.path.join(source_dir, acname)
+        if not os.path.isfile(acpath):
+            continue
+        try:
+            content = open(acpath, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+
+        # PKG_CHECK_MODULES([VAR], [pkg-spec >= version, pkg2 ...])
+        for m in _PKG_CHECK.finditer(content):
+            # pkg spec may be "gnutls >= 3.1.10, libidn2 >= 0.5.0" — split on comma
+            spec_raw = m.group(1).strip().rstrip("]")
+            for spec in spec_raw.split(","):
+                pkg = spec.strip().split()[0].strip("[]")
+                if not pkg or len(pkg) > 50:
+                    continue
+                key = f"pkg-config: {pkg}"
+                if key in results:
+                    continue
+                # Search for the .pc file first (most precise)
+                cands = _apt_file_search(f"{pkg}.pc")
+                if not cands:
+                    cands = _apt_file_search(pkg)
+                results[key] = [p for p in cands if p.endswith("-dev")][:5]
+
+        # AC_CHECK_LIB([libname], [function])
+        for m in _CHECK_LIB.finditer(content):
+            libname = m.group(1).strip().strip("[]").strip()
+            if not libname or len(libname) > 40:
+                continue
+            key = f"AC_CHECK_LIB: {libname}"
+            if key in results:
+                continue
+            cands = _apt_file_search(f"lib{libname}.so")
+            if not cands:
+                cands = _apt_file_search(f"lib{libname}.a")
+            dev = [p for p in cands if p.endswith("-dev")]
+            if dev:
+                results[key] = dev[:5]
+
+        # AC_SEARCH_LIBS([func], [lib1 lib2 ...])
+        for m in _SEARCH_LIBS.finditer(content):
+            for libname in m.group(1).strip().rstrip("]").split():
+                libname = libname.strip("[]").strip()
+                if not libname or len(libname) > 40:
+                    continue
+                key = f"AC_SEARCH_LIBS: {libname}"
+                if key in results:
+                    continue
+                cands = _apt_file_search(f"lib{libname}.so")
+                dev = [p for p in cands if p.endswith("-dev")]
+                if dev:
+                    results[key] = dev[:5]
+        break  # found configure.ac, no need for configure.in
+
+    # ── CMake ─────────────────────────────────────────────────────────────────
+    cmake = os.path.join(source_dir, "CMakeLists.txt")
+    if os.path.isfile(cmake):
+        try:
+            content = open(cmake, encoding="utf-8", errors="replace").read()
+        except OSError:
+            content = ""
+        # find_package(OpenSSL REQUIRED) → OpenSSL → try openssl.pc + libssl-dev
+        for m in _CMAKE_FIND.finditer(content):
+            pkg = m.group(1).strip()
+            if not pkg or len(pkg) > 50:
+                continue
+            key = f"cmake find_package: {pkg}"
+            if key in results:
+                continue
+            cands = _apt_file_search(f"{pkg.lower()}.pc")
+            if not cands:
+                cands = _apt_file_search(pkg.lower())
+            dev = [p for p in cands if p.endswith("-dev")]
+            if dev:
+                results[key] = dev[:5]
+        # pkg_check_modules(OPENSSL openssl)
+        for m in _CMAKE_PKG.finditer(content):
+            pkg = m.group(1).strip()
+            if not pkg or len(pkg) > 50:
+                continue
+            key = f"cmake pkg: {pkg}"
+            if key in results:
+                continue
+            cands = _apt_file_search(f"{pkg}.pc")
+            dev = [p for p in cands if p.endswith("-dev")]
+            if dev:
+                results[key] = dev[:5]
+
+    return results
+
+
 def scan_c_headers(source_dir: str) -> set[str]:
     """Extract unique #include <...> header paths from C/C++ source files.
 
@@ -301,16 +415,18 @@ def _ask_item(description: str, candidates: list[str], llm_budget: dict) -> str 
 
 
 def resolve_with_llm(c_results: dict, py_results: dict,
-                     go_modules: list[str], llm_budget: dict) -> list[str]:
+                     go_modules: list[str], ac_results: dict,
+                     llm_budget: dict) -> list[str]:
     """
-    Call the LLM once per unique header/module to select the best package.
+    Call the LLM once per unique header/module/autoconf entry to select the best package.
     Returns a raw (possibly duplicate) list of package names.
     """
     collected = []
     all_items = (
         [(f"C/C++ header <{h}>", pkgs) for h, pkgs in c_results.items()] +
         [(f"Python module '{m}'", pkgs) for m, pkgs in py_results.items()] +
-        [(f"Go module '{m}'", []) for m in go_modules]
+        [(f"Go module '{m}'", []) for m in go_modules] +
+        [(desc, pkgs) for desc, pkgs in ac_results.items()]
     )
     total = len(all_items)
 
@@ -394,18 +510,24 @@ def detect(source_dir: str, write: bool = False) -> dict:
     if build_tools:
         print(f"  [*] Build tools: {', '.join(build_tools)}", file=sys.stderr)
 
-    if not c_headers and not py_modules and not go_modules and not build_tools:
-        return {"status": "success", "dependencies": [], "agent": "detective",
-                "note": "No external dependencies found in source tree."}
-
-    # Phase 1: resolve via apt-file
+    # Phase 1a: resolve via apt-file (headers)
     c_results  = resolve_c_headers(c_headers)  if c_headers  else {}
     py_results = resolve_python_modules(py_modules) if py_modules else {}
 
+    # Phase 1b: autoconf/CMake explicit library checks (much more precise)
+    ac_results = scan_autoconf_deps(source_dir)
+    if ac_results:
+        print(f"  [*] Found {len(ac_results)} autoconf/cmake library checks", file=sys.stderr)
+
+    total_items = len(c_results) + len(py_results) + len(go_modules) + len(ac_results)
+    if not total_items and not build_tools:
+        return {"status": "success", "dependencies": [], "agent": "detective",
+                "note": "No external dependencies found in source tree."}
+
     # Phase 2: per-item LLM calls (15s each, 3-min total budget)
-    print(f"  [*] Phase 2: asking AI per dependency ...", file=sys.stderr)
+    print(f"  [*] Phase 2: asking AI per dependency ({total_items} items) ...", file=sys.stderr)
     llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
-    raw_deps = resolve_with_llm(c_results, py_results, go_modules, llm_budget)
+    raw_deps = resolve_with_llm(c_results, py_results, go_modules, ac_results, llm_budget)
 
     # Add build system tools directly (no LLM needed — deterministic)
     raw_deps.extend(build_tools)
