@@ -47,13 +47,39 @@ Requires `quilt` and `patch`: `sudo apt install quilt patch`
 python3 agents/builder.py <source_dir>
 ```
 
-On failure the builder extracts the last 20 lines of the build log and asks the LLM to classify the error and suggest the recovery command:
+Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`.
 
-| Error type | Suggested agent |
-|------------|----------------|
-| Missing `-dev` package | `detective` |
-| Compilation / syntax error | `patch_manager` |
-| Packaging file problem | `auditor` |
+**Success** — returns and prints:
+
+```json
+{
+  "status": "success",
+  "message": "Package built successfully.",
+  "log_lines": 42,
+  "agent": "builder"
+}
+```
+
+**Failure** — the builder extracts the last 20 lines of the build log, sends them to the LLM for classification, and returns a recovery suggestion:
+
+```json
+{
+  "status": "error",
+  "error_type": "missing_dependency",
+  "suggested_agent": "detective",
+  "suggested_command": "python3 agents/detective.py <source_dir> --write",
+  "analysis": "Build-Depends is missing libssl-dev.",
+  "log_tail": "...",
+  "agent": "builder"
+}
+```
+
+| Error type | Detected by | Suggested agent |
+|------------|-------------|----------------|
+| Missing `-dev` package / unmet build deps | `dpkg-checkbuilddeps` output | `detective` |
+| Compilation or syntax error | `make` / compiler output | `patch_manager` |
+| Packaging file problem | `dh_*` / `dpkg-source` output | `auditor` |
+| Unknown | LLM fallback | `detective` |
 
 Requires `debuild`: `sudo apt install devscripts`
 
