@@ -27,6 +27,7 @@ asciinema play demo/demo_personas.cast
 | **detective** | 2 Detect | Scans C headers + autoconf/CMake macros → generates `Build-Depends` |
 | **scribe** | 3 Scribe | Reads git log → drafts a `debian/changelog` entry |
 | **patch_manager** | 4 Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
+| **builder** | 5 Build | Runs `debuild -us -uc -b`; on failure uses AI to classify the error and recommend the recovery agent |
 
 ### patch_manager — Quilt Patch Workflow
 
@@ -39,6 +40,22 @@ python3 agents/patch_manager.py <source_dir> <patch-name> "<description>"
 ```
 
 Requires `quilt` and `patch`: `sudo apt install quilt patch`
+
+### builder — Debian Build + AI Failure Analysis
+
+```bash
+python3 agents/builder.py <source_dir>
+```
+
+On failure the builder extracts the last 20 lines of the build log and asks the LLM to classify the error and suggest the recovery command:
+
+| Error type | Suggested agent |
+|------------|----------------|
+| Missing `-dev` package | `detective` |
+| Compilation / syntax error | `patch_manager` |
+| Packaging file problem | `auditor` |
+
+Requires `debuild`: `sudo apt install devscripts`
 
 ## Persona levels
 

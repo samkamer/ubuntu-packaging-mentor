@@ -1,6 +1,6 @@
 # Test Suite
 
-100 regression tests covering all three agents and shared utilities.
+130 regression tests covering all five agents and shared utilities.
 
 ## Quick start
 
@@ -37,6 +37,7 @@ real LLM timeout.
 | `pytest` | all tests | `pip install pytest --break-system-packages` |
 | `licensecheck` | `TestAuditorIntegration` | `sudo apt install licensecheck` |
 | `apt-file` | `TestDetectiveIntegration` | `sudo apt install apt-file` |
+| `quilt`, `patch` | `TestPatchManagerIntegration` (future) | `sudo apt install quilt patch` |
 
 Integration tests **skip automatically** (not fail) when their required tool
 is absent, so `pytest` always exits cleanly on a minimal install.
@@ -49,6 +50,8 @@ is absent, so `pytest` always exits cleanly on a minimal install.
 | `test_auditor.py` | 22 | `_is_valid_dep5()`, `_regex_fallback()` (15 license mappings), `parse_licensecheck_output()`, `build_dep5()` |
 | `test_detective.py` | 18 | `_is_stdlib()`, `_should_skip_dir()`, `_PLATFORM_SKIP` regex, `scan_build_system()` (autoconf/cmake/meson/quilt), `scan_autoconf_deps()` |
 | `test_scribe.py` | 17 | `_get_package_name()`, `_get_last_version()` (Debian revision bump), `_get_git_log()` (`.git` guard), `_extract_bullets()`, `_validate_entry()` (3-tier fallback), `_build_stub()` |
+| `test_patch_manager.py` | 21 | `_build_file_index()` (skip dirs/extensions/debian/, sort order), `_read_file_context()` (line numbers, truncation), `_extract_diff()` (strip fences/prose), `patch()` (bad dir, empty tree, dry-run) |
+| `test_builder.py` | 21 | `_classify_error()` (all error categories), `_regex_recovery()` (agent mapping), `_parse_llm_response()` (structured + fallback), `build()` (bad dir, missing debian/, no debuild, success/failure result shape) |
 | `test_integration.py` | 16 | End-to-end `audit()`, `detect()`, `scribe()` against `lab/sources/hello-package`; write-flag safety checks |
 
 ## Running subsets
