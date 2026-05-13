@@ -189,17 +189,51 @@ def _build_entry_with_llm(
 
 # ── Entry validation / fallback ───────────────────────────────────────────────
 
+# Matches bullet lines the LLM tends to produce: "* foo", "- foo", "  * foo"
+_BULLET_RE = re.compile(r'^\s*[\*\-]\s+(.+)')
+# Matches the trailer line: " -- Name <email>  Date"
+_TRAILER_RE = re.compile(r'^\s*--\s+.+<.+>\s+\w{3},')
+
+
+def _extract_bullets(text: str) -> list[str]:
+    """Pull bullet item text out of a free-form LLM response."""
+    bullets = []
+    for line in text.splitlines():
+        m = _BULLET_RE.match(line)
+        if m:
+            bullets.append(m.group(1).strip())
+    return bullets
+
+
 def _validate_entry(text: str, pkg: str, version: str,
                     release: str, name: str, email: str, rfc_date: str) -> str:
     """
-    Check the LLM response looks like a real changelog stanza.
-    If it doesn't match, build a minimal correct stub.
+    Validate the LLM response as a debian/changelog stanza.
+
+    Strategy (in order):
+      1. First line already matches the stanza header  → use as-is.
+      2. The text contains bullet items                → rescue those bullets,
+         build a correctly-structured stanza around them.
+      3. Nothing useful                               → plain stub with
+                                                        'Initial release.'
     """
     lines = text.strip().splitlines()
+
+    # 1. Looks correct already
     if lines and _STANZA_RE.match(lines[0]):
         return text.strip() + "\n"
 
-    print("  [~] LLM response did not match changelog format — using stub", file=sys.stderr)
+    print("  [~] LLM response header did not match — attempting to rescue bullets",
+          file=sys.stderr)
+
+    # 2. Rescue any bullet points the LLM wrote
+    bullets = _extract_bullets(text)
+    if bullets:
+        print(f"  [~] Rescued {len(bullets)} bullet(s) from LLM output", file=sys.stderr)
+        return _build_stub(pkg, version, release, name, email, rfc_date, bullets)
+
+    # 3. Nothing useful — minimal stub
+    print("  [~] No bullets found either — using bare stub", file=sys.stderr)
     return _build_stub(pkg, version, release, name, email, rfc_date)
 
 
