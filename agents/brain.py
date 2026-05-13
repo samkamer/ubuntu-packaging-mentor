@@ -313,7 +313,6 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
         return "src/hello.c"
     if "apply the following fix" in up:
         # Return a minimal no-op unified diff so the demo doesn't break patch(1)
-        # Extract the filename from the prompt
         rel = "src/hello.c"
         for token in user_prompt.split("'"):
             if "/" in token and not token.startswith(" "):
@@ -327,6 +326,34 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             "+/* patch_manager demo patch applied */\n"
             " #include <stdio.h>\n"
             " #include <stdlib.h>\n"
+        )
+
+    # ── builder internals ─────────────────────────────────────────────────────
+    if "last 20 lines of the debuild output" in up:
+        if "cannot find" in up or "no such file" in up or "unmet build" in up:
+            return (
+                "ERROR_TYPE: missing_dependency\n"
+                "AGENT: detective\n"
+                "COMMAND: python3 agents/detective.py <source_dir> --write\n"
+                "ANALYSIS: The build failed because one or more -dev packages are missing "
+                "from Build-Depends. Run detective to scan the source tree and regenerate "
+                "a complete Build-Depends list."
+            )
+        if "syntax error" in up or "error:" in up or "compilation failed" in up:
+            return (
+                "ERROR_TYPE: syntax_error\n"
+                "AGENT: patch_manager\n"
+                "COMMAND: python3 agents/patch_manager.py <source_dir> fix-build-error "
+                "\"Fix compilation error identified in build log\"\n"
+                "ANALYSIS: A compilation or syntax error was found in the source code. "
+                "Use patch_manager to generate and apply a corrective patch."
+            )
+        return (
+            "ERROR_TYPE: packaging_mistake\n"
+            "AGENT: auditor\n"
+            "COMMAND: python3 agents/auditor.py <source_dir> --write\n"
+            "ANALYSIS: The build failed due to a packaging configuration issue. "
+            "Run auditor to review and regenerate the debian/ metadata files."
         )
 
     return "Task completed."

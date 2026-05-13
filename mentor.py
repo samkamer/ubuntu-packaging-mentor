@@ -12,6 +12,7 @@ from agents.auditor import audit as run_audit
 from agents.detective import detect as run_detect
 from agents.scribe import scribe as run_scribe
 from agents.patch_manager import patch as run_patch
+from agents.builder import build as run_build
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -89,6 +90,11 @@ SKILLS = {
         "agent": "patch_manager.py",
         "description": "Source patching — generates and applies a quilt patch via LLM.",
     },
+    "5": {
+        "name": "Build",
+        "agent": "builder.py",
+        "description": "Package build — runs debuild and analyses failures with AI.",
+    },
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -157,6 +163,13 @@ _EXPLAIN_PROMPTS = {
             "unified diff, and apply it as a new quilt patch in debian/patches/.\n"
             "Explain what quilt patches are, why Debian packages use them, and what this tool does."
         ),
+        "Build": (
+            "The user is about to run the Build skill on a source package directory.\n"
+            "The tool runs 'debuild -us -uc -b' to produce binary .deb packages, "
+            "and if the build fails, uses AI to classify the error and suggest which "
+            "agent (detective, patch_manager, or auditor) to run to fix it.\n"
+            "Explain what debuild does, what a binary build produces, and why build testing matters."
+        ),
     },
     "before_write": {
         "Audit": (
@@ -183,6 +196,11 @@ _EXPLAIN_PROMPTS = {
             "Explain how quilt tracks patches in debian/patches/, what 'quilt refresh' does, "
             "and what to check after the patch is applied."
         ),
+        "Build": (
+            "The Build agent is about to run 'debuild -us -uc -b'.\n"
+            "Explain what this command does, what output files it produces, "
+            "and what a successful build result looks like."
+        ),
     },
     "post_result": {
         "Audit": (
@@ -205,12 +223,19 @@ _EXPLAIN_PROMPTS = {
             "Explain what the user should verify in the generated patch file, how to test "
             "the change builds correctly, and how to include it in a source package upload."
         ),
+        "Build": (
+            "The Build agent has finished running debuild.\n"
+            "If successful, explain what .deb files were produced and what to do next.\n"
+            "If it failed, explain the error type identified and why the suggested agent "
+            "and command will resolve it."
+        ),
     },
     "on_error": {
         "Audit":  "The Audit agent reported an error running licensecheck on the package source.",
         "Detect": "The Detect agent reported an error scanning for Build-Depends.",
         "Scribe": "The Scribe agent reported an error generating the changelog entry.",
         "Patch":  "The Patch agent reported an error generating or applying the quilt patch.",
+        "Build":  "The Build agent reported an error running debuild.",
     },
 }
 
@@ -220,6 +245,7 @@ _COREDEV_SUMMARY = {
     "Detect": lambda r: f"{len(r.get('dependencies', []))} Build-Depends resolved.",
     "Scribe": lambda r: "changelog entry drafted.",
     "Patch":  lambda r: f"patch {r.get('patch','')} applied to {r.get('file','')}.",
+    "Build":  lambda r: "Build succeeded." if r.get("status") == "success" else f"Build failed: {r.get('error_type','unknown')} → {r.get('suggested_agent')}.",
 }
 
 
@@ -311,6 +337,10 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         dry_run     = prompt("Dry run only — preview diff without applying? [y/N]:").lower() == "y"
         result      = run_patch(target, patch_name, description, dry_run=dry_run)
 
+    elif sname == "Build":
+        _persona_explain("before_write", sname, persona, label="Build: context")
+        result = run_build(target)
+
     else:
         result = {"status": "error", "error": f"Unknown skill: {sname}",
                   "agent": sname.lower()}
@@ -370,6 +400,24 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
             if is_coredev:
                 print(c(CYAN, f"  {_COREDEV_SUMMARY['Patch'](result)}"))
 
+    elif sname == "Build":
+        if result.get("status") == "success":
+            print(c(GREEN, f"\n  ✓ {result['message']}"))
+            print(c(CYAN,  f"  Build log lines: {result.get('log_lines', '?')}"))
+            if is_coredev:
+                print(c(CYAN, f"  {_COREDEV_SUMMARY['Build'](result)}"))
+        else:
+            print(c(RED,    f"\n  Build failed"))
+            print(c(YELLOW, f"  Error type     : {result.get('error_type', 'unknown')}"))
+            print(c(YELLOW, f"  Analysis       : {result.get('analysis', '')}"))
+            print(c(CYAN,   f"\n  Suggested fix  → {result.get('suggested_agent')}"))
+            print(c(CYAN,   f"  Command        : {result.get('suggested_command')}"))
+            print(c(CYAN,   "\n── Last build output ──────────────────────────────"))
+            print(result.get("log_tail", "").strip())
+            print(c(CYAN,   "───────────────────────────────────────────────────"))
+            if is_coredev:
+                print(c(CYAN, f"  {_COREDEV_SUMMARY['Build'](result)}"))
+
     else:
         print(json.dumps(result, indent=2))
 
@@ -403,7 +451,7 @@ def main() -> None:
     # 3. Main skill loop
     while True:
         print_menu("Select a skill:", SKILLS)
-        choice = prompt("Enter choice [1-4]:")
+        choice = prompt("Enter choice [1-5]:")
 
         if choice == "q":
             print(c(GREEN, "\nGoodbye!\n"))
