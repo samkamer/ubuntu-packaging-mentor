@@ -70,6 +70,26 @@ def llm_budget_seconds() -> float:
     return float(_DEFAULT_BUDGET)
 
 
+# ── File backup utility ───────────────────────────────────────────────────────
+
+import shutil as _shutil
+from datetime import datetime as _datetime
+
+def backup_file(path: str) -> str | None:
+    """
+    Copy *path* to *path*.<YYYYMMDD-HHMMSS>.bak if it exists.
+
+    Returns the backup path on success, or None if the file didn't exist.
+    Intended for 'Beginner' mode so learners can always recover the original.
+    """
+    if not os.path.isfile(path):
+        return None
+    stamp = _datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = f"{path}.{stamp}.bak"
+    _shutil.copy2(path, backup_path)
+    return backup_path
+
+
 # ── Spinner ───────────────────────────────────────────────────────────────────
 
 class Spinner:

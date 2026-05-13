@@ -168,17 +168,18 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         print(c(RED, f"  [brain] {e}"))
 
     # Step 2: invoke real agent or fall back to mock
+    is_beginner = persona["name"] == "Beginner"
     print(c(CYAN, "Calling Agent..."))
     if skill["name"] == "Audit":
         write = prompt("Write debian/copyright to target directory? [y/N]:").lower() == "y"
-        result = run_audit(target, write=write)
+        result = run_audit(target, write=write, backup=is_beginner)
     elif skill["name"] == "Detect":
         write = prompt("Write Build-Depends to debian/control? [y/N]:").lower() == "y"
-        result = run_detect(target, write=write)
+        result = run_detect(target, write=write, backup=is_beginner)
     elif skill["name"] == "Scribe":
         release = prompt("Target release name [noble]:") or "noble"
         write   = prompt("Prepend entry to debian/changelog? [y/N]:").lower() == "y"
-        result  = run_scribe(target, release=release, write=write)
+        result  = run_scribe(target, release=release, write=write, backup=is_beginner)
     else:
         result = skill["mock_result"]
 
@@ -193,6 +194,8 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
             print(c(CYAN, "────────────────────────────────────────────────────"))
             if result.get("written_to"):
                 print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+                if result.get("backed_up"):
+                    print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
             else:
                 print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
         elif skill["name"] == "Detect" and result.get("dependencies") is not None:
@@ -203,6 +206,8 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                 print(c(CYAN, "────────────────────────────────────────────────────"))
                 if result.get("written_to"):
                     print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+                    if result.get("backed_up"):
+                        print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
                 else:
                     print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
             else:
@@ -213,6 +218,9 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
             print(c(CYAN, "────────────────────────────────────────────────────"))
             if result.get("written_to"):
                 print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+                if result.get("backed_up"):
+                    print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
+
             else:
                 print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
         else:

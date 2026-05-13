@@ -29,7 +29,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask, llm_budget_seconds
+from agents.brain import ask, llm_budget_seconds, backup_file
 
 # ── DEP-5 / SPDX known identifiers ───────────────────────────────────────────
 
@@ -261,7 +261,7 @@ def build_dep5(groups: dict, source_name: str) -> str:
 
 # ── Main audit function ───────────────────────────────────────────────────────
 
-def audit(source_dir: str, write: bool = False) -> dict:
+def audit(source_dir: str, write: bool = False, backup: bool = False) -> dict:
     if not os.path.isdir(source_dir):
         return {"status": "error", "data": None, "agent": "auditor",
                 "error": f"Directory not found: {source_dir}"}
@@ -292,14 +292,20 @@ def audit(source_dir: str, write: bool = False) -> dict:
     dep5_text = build_dep5(groups, source_name)
 
     written_to = None
+    backed_up  = None
     if write:
         debian_dir = os.path.join(source_dir, "debian")
         os.makedirs(debian_dir, exist_ok=True)
         written_to = os.path.join(debian_dir, "copyright")
+        if backup:
+            backed_up = backup_file(written_to)
+            if backed_up:
+                print(f"  [✓] Backup: {backed_up}", file=sys.stderr)
         with open(written_to, "w", encoding="utf-8") as fh:
             fh.write(dep5_text)
 
-    return {"status": "success", "data": dep5_text, "agent": "auditor", "written_to": written_to}
+    return {"status": "success", "data": dep5_text, "agent": "auditor",
+            "written_to": written_to, "backed_up": backed_up}
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

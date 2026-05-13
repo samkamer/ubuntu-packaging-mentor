@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask, llm_budget_seconds
+from agents.brain import ask, llm_budget_seconds, backup_file
 
 # ── Language detection / scanning ─────────────────────────────────────────────
 
@@ -487,7 +487,7 @@ def deduplicate_with_llm(raw_deps: list[str]) -> list[str]:
 
 # ── Main detect function ──────────────────────────────────────────────────────
 
-def detect(source_dir: str, write: bool = False) -> dict:
+def detect(source_dir: str, write: bool = False, backup: bool = False) -> dict:
     if not os.path.isdir(source_dir):
         return {"status": "error", "dependencies": None, "agent": "detective",
                 "error": f"Directory not found: {source_dir}"}
@@ -538,11 +538,17 @@ def detect(source_dir: str, write: bool = False) -> dict:
     deps = deduplicate_with_llm(raw_deps)
 
     written_to = None
+    backed_up  = None
     if write and deps:
+        if backup:
+            control_path = os.path.join(source_dir, "debian", "control")
+            backed_up = backup_file(control_path)
+            if backed_up:
+                print(f"  [✓] Backup: {backed_up}", file=sys.stderr)
         written_to = _write_control(source_dir, deps)
 
     return {"status": "success", "dependencies": deps, "agent": "detective",
-            "written_to": written_to}
+            "written_to": written_to, "backed_up": backed_up}
 
 
 # ── debian/control writer ─────────────────────────────────────────────────────

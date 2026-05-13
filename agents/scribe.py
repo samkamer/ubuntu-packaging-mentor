@@ -31,7 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask
+from agents.brain import ask, backup_file
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ def _write_changelog(source_dir: str, entry: str) -> str:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def scribe(source_dir: str, release: str = DEFAULT_RELEASE,
-           write: bool = False) -> dict:
+           write: bool = False, backup: bool = False) -> dict:
     """
     Main entry point.
 
@@ -322,12 +322,18 @@ def scribe(source_dir: str, release: str = DEFAULT_RELEASE,
         entry = _build_stub(pkg, version, release, name, email, rfc_date, items)
 
     written_to = None
+    backed_up  = None
     if write:
+        if backup:
+            changelog_path = os.path.join(source_dir, "debian", "changelog")
+            backed_up = backup_file(changelog_path)
+            if backed_up:
+                print(f"  [✓] Backup: {backed_up}", file=sys.stderr)
         written_to = _write_changelog(source_dir, entry)
         print(f"  [✓] Written to {written_to}", file=sys.stderr)
 
     return {"status": "success", "data": entry, "agent": "scribe",
-            "written_to": written_to}
+            "written_to": written_to, "backed_up": backed_up}
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
