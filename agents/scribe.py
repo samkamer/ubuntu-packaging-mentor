@@ -122,13 +122,20 @@ def _get_last_version(source_dir: str) -> str:
 def _get_git_log(source_dir: str, max_commits: int = MAX_COMMITS) -> list[str]:
     """
     Return the last `max_commits` git commit subject lines from source_dir.
-    Returns an empty list if the directory is not a git repo.
+
+    Only reads git history if source_dir is itself a git repository root
+    (contains a .git entry). This prevents git from walking up into a
+    parent repo when the package source has no git history of its own.
     """
+    abs_src = os.path.realpath(source_dir)
+    # Require an owned .git so we never accidentally read a parent repo
+    if not os.path.exists(os.path.join(abs_src, ".git")):
+        return []
     try:
         result = subprocess.run(
             ["git", "log", f"--max-count={max_commits}",
              "--pretty=format:* %s  (%h  %ad)", "--date=short"],
-            cwd=source_dir, capture_output=True, text=True, timeout=15,
+            cwd=abs_src, capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().splitlines()
