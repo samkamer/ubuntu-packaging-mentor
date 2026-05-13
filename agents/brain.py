@@ -151,14 +151,24 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
     """
     Instant canned responses for AI_PROVIDER=demo.
     Selects a response by matching the touchpoint phrase in the combined prompt.
+    MOTU vs Beginner is distinguished by the system_prompt content.
     Used to record demo videos without waiting for a live LLM.
     """
     import time as _time
     _time.sleep(1.0)   # brief pause so the spinner is visible in the recording
-    up = user_prompt.lower()   # match on user_prompt only (more specific)
+    up  = user_prompt.lower()   # match on user_prompt only (more specific)
+    sp  = system_prompt.lower()
+    is_motu = "motu" in sp or "policy manual" in sp
 
     # ── Pre-skill explanations (from _EXPLAIN_PROMPTS["pre_skill"]) ───────────
     if "user is about to run the audit skill" in up:
+        if is_motu:
+            return (
+                "Per Debian Policy §12.5 and the Ubuntu Packaging Guide, every source "
+                "package must ship a machine-readable debian/copyright in DEP-5 format. "
+                "The Audit skill automates running licensecheck(1) and normalising each "
+                "SPDX identifier — saving you from a manual file-by-file survey before upload."
+            )
         return (
             "The Audit skill scans every source file for its license and copyright "
             "holder, then produces a DEP-5 debian/copyright file — the machine-readable "
@@ -166,6 +176,13 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             "Think of it as the legal receipt for all the code you're shipping."
         )
     if "user is about to run the detect skill" in up:
+        if is_motu:
+            return (
+                "Debian Policy §7.6 requires every Build-Depends to be explicitly listed "
+                "in debian/control. The Detect skill parses #include directives and "
+                "PKG_CHECK_MODULES macros, running apt-file to resolve each to the "
+                "correct -dev package — satisfying Policy without manual dependency tracing."
+            )
         return (
             "Build-Depends lists every package the build system needs before it can "
             "compile your source. The Detect skill scans #include directives and "
@@ -173,6 +190,13 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             "saving you from chasing missing headers by hand."
         )
     if "user is about to run the scribe skill" in up:
+        if is_motu:
+            return (
+                "Debian Policy §4.4 mandates a debian/changelog entry for every upload, "
+                "with the exact stanza format parsed by dpkg-parsechangelog. The Scribe "
+                "skill reads your git log and produces a policy-compliant entry — "
+                "ensuring the version, suite, and RFC 5322 trailer are all correct."
+            )
         return (
             "debian/changelog is the official release history of your package. Each "
             "stanza records who changed what and when, and sets the version number dpkg "
@@ -182,18 +206,39 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
 
     # ── Before-write guidance (from _EXPLAIN_PROMPTS["before_write"]) ─────────
     if "audit agent has finished generating a dep-5" in up:
+        if is_motu:
+            return (
+                "Policy check: verify all SPDX identifiers are canonical "
+                "(licensecheck --check-spdx), the Files: glob patterns don't overlap, "
+                "and the Source: URL points to upstream. Run 'lintian --pedantic' "
+                "before upload to catch any remaining copyright issues."
+            )
         return (
             "Before saving: verify all copyright holders appear under their Files: "
             "stanza, License: identifiers are valid SPDX names (e.g. GPL-2.0-only), "
             "and any third-party vendored code has its own stanza."
         )
     if "detect agent has finished generating a build-depends" in up:
+        if is_motu:
+            return (
+                "Policy check: confirm all -dev packages are in the correct "
+                "Build-Depends (not Build-Depends-Indep unless arch-independent), "
+                "version-constrain anything with a known ABI break, and strip "
+                "anything already pulled in by debhelper transitively."
+            )
         return (
             "Before saving: confirm every -dev package exists in the target release "
             "('apt-cache show <pkg>'), remove transitively-pulled duplicates, and make "
             "sure debhelper-compat is present with the right compat level."
         )
     if "scribe agent has finished generating a debian/changelog" in up:
+        if is_motu:
+            return (
+                "Policy check: version must be higher than the last archive upload "
+                "(check rmadison), suite must match the target pocket, and the "
+                "' -- Maintainer <email>  Date' trailer must parse cleanly with "
+                "dpkg-parsechangelog --show-field Date before you sign and upload."
+            )
         return (
             "Before saving: check the version is higher than the last upload, the suite "
             "name matches your target (e.g. 'noble'), and the ' -- Name <email>  Date' "
@@ -202,18 +247,36 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
 
     # ── Post-result guidance (from _EXPLAIN_PROMPTS["post_result"]) ───────────
     if "audit agent has generated the dep-5" in up:
+        if is_motu:
+            return (
+                "Run 'lintian -i --pedantic' — look for copyright-file-contains-full-gpl-license "
+                "and missing-license-paragraph-in-dep5. Next: Detect to fill Build-Depends, "
+                "then test with 'sbuild --dist=noble'."
+            )
         return (
             "Review for UNKNOWN license identifiers — those need manual research. "
             "Next: run 'lintian' to catch remaining issues, then move on to Detect "
             "to fill in your Build-Depends."
         )
     if "detect agent has produced the build-depends" in up:
+        if is_motu:
+            return (
+                "Verify with 'dpkg-depcheck -d debian/rules build' inside a clean "
+                "pbuilder chroot. Check for any missing Breaks/Replaces if you're "
+                "splitting a package. Next: Scribe for the changelog, then sign with debsign."
+            )
         return (
             "Cross-check with 'dpkg-depcheck -d debian/rules build' at build time. "
             "Next: run the Scribe skill to draft your debian/changelog entry, then "
             "test the full build with 'sbuild' or 'pbuilder'."
         )
     if "scribe agent has written the debian/changelog" in up:
+        if is_motu:
+            return (
+                "Verify with 'dpkg-parsechangelog' — check Version, Distribution and "
+                "Urgency fields. Then 'debsign -k<keyid>' and 'dput ubuntu <changes>' "
+                "or request a sponsor if you don't have upload rights."
+            )
         return (
             "Verify the version bumped correctly and the suite is right. "
             "Next: sign with 'debsign' and upload via 'dput' to your PPA or "
@@ -238,6 +301,32 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             "  * Added greeting binary with --name flag support.\n"
             "  * Included man page and bash completion script.\n\n"
             " -- Demo Maintainer <demo@ubuntu.com>  Wed, 13 May 2026 14:00:00 +0000\n"
+        )
+
+    # ── patch_manager internals ───────────────────────────────────────────────
+    if "reply with only the relative path" in up:
+        # Return the first .c or .py file from the index snippet in the prompt
+        for line in user_prompt.splitlines():
+            line = line.strip()
+            if line.endswith(".c") or line.endswith(".py") or line.endswith(".sh"):
+                return line
+        return "src/hello.c"
+    if "apply the following fix" in up:
+        # Return a minimal no-op unified diff so the demo doesn't break patch(1)
+        # Extract the filename from the prompt
+        rel = "src/hello.c"
+        for token in user_prompt.split("'"):
+            if "/" in token and not token.startswith(" "):
+                rel = token.strip()
+                break
+        return (
+            f"--- a/{rel}\n"
+            f"+++ b/{rel}\n"
+            "@@ -1,3 +1,4 @@\n"
+            " /* hello — greeting utility */\n"
+            "+/* patch_manager demo patch applied */\n"
+            " #include <stdio.h>\n"
+            " #include <stdlib.h>\n"
         )
 
     return "Task completed."

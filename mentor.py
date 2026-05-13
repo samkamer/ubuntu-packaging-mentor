@@ -11,6 +11,7 @@ from agents.brain import ask
 from agents.auditor import audit as run_audit
 from agents.detective import detect as run_detect
 from agents.scribe import scribe as run_scribe
+from agents.patch_manager import patch as run_patch
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -85,15 +86,8 @@ SKILLS = {
     },
     "4": {
         "name": "Patch",
-        "agent": "quilt_master.py",
-        "description": "Source patching — manages quilt patch series on upstream source.",
-        "mock_result": {
-            "status": "ok",
-            "data": {
-                "patches_applied": 0,
-                "series_file": "debian/patches/series",
-            },
-        },
+        "agent": "patch_manager.py",
+        "description": "Source patching — generates and applies a quilt patch via LLM.",
     },
 }
 
@@ -157,6 +151,12 @@ _EXPLAIN_PROMPTS = {
             "debian/changelog entry with the correct stanza structure.\n"
             "Explain the debian/changelog format and why it matters for packaging."
         ),
+        "Patch": (
+            "The user is about to run the Patch skill on a source package directory.\n"
+            "The tool uses AI to identify which source file needs changing, generate a "
+            "unified diff, and apply it as a new quilt patch in debian/patches/.\n"
+            "Explain what quilt patches are, why Debian packages use them, and what this tool does."
+        ),
     },
     "before_write": {
         "Audit": (
@@ -177,6 +177,12 @@ _EXPLAIN_PROMPTS = {
             "Explain the changelog format rules, what to review, and why the trailer "
             "line format must be exact."
         ),
+        "Patch": (
+            "The Patch agent is about to generate and apply a quilt patch.\n"
+            "The user provided a patch name and a description of the fix.\n"
+            "Explain how quilt tracks patches in debian/patches/, what 'quilt refresh' does, "
+            "and what to check after the patch is applied."
+        ),
     },
     "post_result": {
         "Audit": (
@@ -194,11 +200,17 @@ _EXPLAIN_PROMPTS = {
             "Explain what the user should review in this entry, whether the version and "
             "release look correct, and what their next packaging step should be."
         ),
+        "Patch": (
+            "The Patch agent has applied the quilt patch shown above.\n"
+            "Explain what the user should verify in the generated patch file, how to test "
+            "the change builds correctly, and how to include it in a source package upload."
+        ),
     },
     "on_error": {
-        "Audit": "The Audit agent reported an error running licensecheck on the package source.",
+        "Audit":  "The Audit agent reported an error running licensecheck on the package source.",
         "Detect": "The Detect agent reported an error scanning for Build-Depends.",
         "Scribe": "The Scribe agent reported an error generating the changelog entry.",
+        "Patch":  "The Patch agent reported an error generating or applying the quilt patch.",
     },
 }
 
@@ -207,6 +219,7 @@ _COREDEV_SUMMARY = {
     "Audit":  lambda r: f"debian/copyright generated ({len(r.get('data','').splitlines())} lines).",
     "Detect": lambda r: f"{len(r.get('dependencies', []))} Build-Depends resolved.",
     "Scribe": lambda r: "changelog entry drafted.",
+    "Patch":  lambda r: f"patch {r.get('patch','')} applied to {r.get('file','')}.",
 }
 
 
@@ -291,8 +304,16 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         write   = prompt("Prepend entry to debian/changelog? [y/N]:").lower() == "y"
         result  = run_scribe(target, release=release, write=write, backup=is_beginner)
 
+    elif sname == "Patch":
+        _persona_explain("before_write", sname, persona, label="Patch: context")
+        patch_name  = prompt("Patch name (e.g. fix-greeting-logic):")
+        description = prompt("Describe the fix in plain English:")
+        dry_run     = prompt("Dry run only — preview diff without applying? [y/N]:").lower() == "y"
+        result      = run_patch(target, patch_name, description, dry_run=dry_run)
+
     else:
-        result = skill["mock_result"]
+        result = {"status": "error", "error": f"Unknown skill: {sname}",
+                  "agent": sname.lower()}
 
     # ── Error path ─────────────────────────────────────────────────────────────
     if result.get("status") == "error":
@@ -333,6 +354,21 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         _show_write_status(result)
         if is_coredev:
             print(c(CYAN, f"  Scribe: {_COREDEV_SUMMARY['Scribe'](result)}"))
+
+    elif sname == "Patch":
+        status = result.get("status")
+        if status == "dry_run":
+            print(c(CYAN, "\n── Dry run — diff preview ────────────────────────"))
+            print(result.get("diff", "").strip())
+            print(c(CYAN, "──────────────────────────────────────────────────"))
+            print(c(YELLOW, f"\n  Target file : {result.get('file')}"))
+            print(c(YELLOW,  "  (No changes written — dry run mode)"))
+        else:
+            print(c(GREEN,  f"\n  Patch applied : {result.get('patch')}"))
+            print(c(CYAN,   f"  Modified file : {result.get('file')}"))
+            print(c(CYAN,   f"  Patch saved   : {result.get('written_to')}"))
+            if is_coredev:
+                print(c(CYAN, f"  {_COREDEV_SUMMARY['Patch'](result)}"))
 
     else:
         print(json.dumps(result, indent=2))
