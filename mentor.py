@@ -172,7 +172,8 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         write = prompt("Write debian/copyright to target directory? [y/N]:").lower() == "y"
         result = run_audit(target, write=write)
     elif skill["name"] == "Detect":
-        result = run_detect(target)
+        write = prompt("Write Build-Depends to debian/control? [y/N]:").lower() == "y"
+        result = run_detect(target, write=write)
     else:
         result = skill["mock_result"]
 
@@ -195,6 +196,10 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                 print(c(CYAN, "\n── Suggested Build-Depends ─────────────────────────"))
                 print("Build-Depends: " + ",\n               ".join(deps))
                 print(c(CYAN, "────────────────────────────────────────────────────"))
+                if result.get("written_to"):
+                    print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
+                else:
+                    print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
             else:
                 print(c(YELLOW, "\nNo external dependencies detected."))
         else:

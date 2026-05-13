@@ -146,13 +146,12 @@ def _apt_file_search(query: str) -> list[str]:
 
 
 def resolve_c_headers(headers: set[str]) -> dict[str, list[str]]:
-    """Map each C header to candidate apt packages (filtered to -dev or /usr/include/)."""
+    """Map each C header to candidate apt packages (filtered to -dev packages)."""
     results = {}
     total = len(headers)
     for i, header in enumerate(sorted(headers), 1):
         print(f"  [apt-file {i}/{total}] searching: {header}", file=sys.stderr)
         candidates = _apt_file_search(header)
-        # Prefer packages that look like dev packages
         dev_pkgs = [p for p in candidates if p.endswith("-dev")]
         results[header] = dev_pkgs if dev_pkgs else candidates[:5]
     return results
@@ -164,7 +163,6 @@ def resolve_python_modules(modules: set[str]) -> dict[str, list[str]]:
     total = len(modules)
     for i, module in enumerate(sorted(modules), 1):
         print(f"  [apt-file {i}/{total}] searching Python: {module}", file=sys.stderr)
-        # Search for the module path inside dist-packages or site-packages
         candidates = _apt_file_search(f"dist-packages/{module}")
         if not candidates:
             candidates = _apt_file_search(f"site-packages/{module}")
@@ -173,42 +171,128 @@ def resolve_python_modules(modules: set[str]) -> dict[str, list[str]]:
     return results
 
 
-# ── LLM reasoning ─────────────────────────────────────────────────────────────
+# ── Per-item LLM reasoning ────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
     "You are an expert Ubuntu/Debian package maintainer. "
     "Your task is to determine the correct Build-Depends entries for a debian/control file."
 )
 
-def ask_llm_for_deps(scan_summary: dict) -> list[str]:
-    """Send the scan results to the LLM and parse its JSON list response."""
-    user_prompt = (
-        "Based on these source headers and apt-file results, provide a deduplicated "
-        "list of Ubuntu -dev packages needed for Build-Depends. "
-        "Format the output as a JSON list, for example: [\"libssl-dev\", \"zlib1g-dev\"]\n\n"
-        f"Scan results:\n{json.dumps(scan_summary, indent=2)}"
-    )
-    response = ask(_SYSTEM_PROMPT, user_prompt, label="Asking AI for Build-Depends")
+LLM_TIMEOUT_PER_CALL = 15
+LLM_BUDGET_SECONDS   = 180
 
-    # Extract JSON list from the response
-    match = re.search(r'\[.*?\]', response, re.DOTALL)
+
+def _regex_best_candidate(candidates: list[str]) -> str | None:
+    """Pick the best candidate from apt-file results without LLM."""
+    dev = [p for p in candidates if p.endswith("-dev")]
+    return dev[0] if dev else (candidates[0] if candidates else None)
+
+
+def _ask_item(description: str, candidates: list[str], llm_budget: dict) -> str | None:
+    """
+    Ask the LLM to pick the single best -dev package for one header/module.
+    Falls back to the top apt-file candidate if budget is exhausted or LLM is slow.
+    """
+    if not candidates:
+        return None
+
+    if llm_budget["remaining"] <= 0:
+        print("  [~] LLM budget exhausted — using apt-file top candidate", file=sys.stderr)
+        return _regex_best_candidate(candidates)
+
+    user_prompt = (
+        f"Which single Ubuntu/Debian -dev package should be listed in Build-Depends "
+        f"to satisfy this dependency?\n\n"
+        f"Dependency: {description}\n"
+        f"apt-file candidates: {', '.join(candidates)}\n\n"
+        "Reply with ONLY the package name (e.g. libssl-dev). "
+        "If none of the candidates are suitable, reply: SKIP"
+    )
+    t0 = time.time()
+    try:
+        result = ask(_SYSTEM_PROMPT, user_prompt, label="", timeout=LLM_TIMEOUT_PER_CALL)
+        llm_budget["remaining"] -= (time.time() - t0)
+        pkg = result.strip().split()[0].rstrip(".,;")
+        if pkg and pkg != "SKIP":
+            return pkg
+    except (RuntimeError, OSError):
+        llm_budget["remaining"] -= (time.time() - t0)
+
+    return _regex_best_candidate(candidates)
+
+
+def resolve_with_llm(c_results: dict, py_results: dict,
+                     go_modules: list[str], llm_budget: dict) -> list[str]:
+    """
+    Call the LLM once per unique header/module to select the best package.
+    Returns a raw (possibly duplicate) list of package names.
+    """
+    collected = []
+    all_items = (
+        [(f"C/C++ header <{h}>", pkgs) for h, pkgs in c_results.items()] +
+        [(f"Python module '{m}'", pkgs) for m, pkgs in py_results.items()] +
+        [(f"Go module '{m}'", []) for m in go_modules]
+    )
+    total = len(all_items)
+
+    for i, (description, candidates) in enumerate(all_items, 1):
+        print(f"  [LLM {i}/{total}] {description}", file=sys.stderr)
+        pkg = _ask_item(description, candidates, llm_budget)
+        if pkg:
+            collected.append(pkg)
+
+    return collected
+
+
+# ── Final deduplication LLM call ──────────────────────────────────────────────
+
+def _parse_json_list(text: str) -> list[str] | None:
+    """Extract a JSON list from an LLM response string."""
+    match = re.search(r'\[.*?\]', text, re.DOTALL)
     if match:
         try:
-            deps = json.loads(match.group())
-            if isinstance(deps, list):
-                return [str(d) for d in deps]
+            result = json.loads(match.group())
+            if isinstance(result, list):
+                return [str(d) for d in result]
         except json.JSONDecodeError:
             pass
+    return None
 
-    # Fallback: extract anything that looks like a package name
-    print("  [~] Could not parse JSON from LLM — extracting package names with regex",
-          file=sys.stderr)
-    return sorted(set(re.findall(r'\b[\w][\w\-.]+(?:-dev|lib[\w-]+)\b', response)))
+
+def deduplicate_with_llm(raw_deps: list[str]) -> list[str]:
+    """
+    Send the full collected package list to the LLM for a final deduplication pass.
+    Removes redundant packages (e.g. libssl-dev when libcurl4-openssl-dev already pulls it),
+    wrong entries, and SKIP placeholders. Falls back to simple set dedup on failure.
+    """
+    # Strip any SKIP placeholders from apt-file fallback
+    candidates = sorted({d for d in raw_deps if d and d.upper() != "SKIP"})
+
+    if not candidates:
+        return []
+
+    user_prompt = (
+        "Below is a raw list of Ubuntu/Debian packages collected for Build-Depends. "
+        "Please deduplicate it: remove redundant entries, non-dev packages that are "
+        "pulled in transitively, and anything that isn't a real apt package name. "
+        "Return ONLY a JSON list of the final Build-Depends packages.\n\n"
+        f"Raw list: {json.dumps(candidates)}"
+    )
+    try:
+        response = ask(_SYSTEM_PROMPT, user_prompt, label="Deduplicating Build-Depends")
+        result = _parse_json_list(response)
+        if result:
+            return sorted(result)
+        print("  [~] Could not parse dedup JSON — using sorted set", file=sys.stderr)
+    except RuntimeError as e:
+        print(f"  [~] Dedup LLM call failed ({e}) — using sorted set", file=sys.stderr)
+
+    return candidates
 
 
 # ── Main detect function ──────────────────────────────────────────────────────
 
-def detect(source_dir: str) -> dict:
+def detect(source_dir: str, write: bool = False) -> dict:
     if not os.path.isdir(source_dir):
         return {"status": "error", "dependencies": None, "agent": "detective",
                 "error": f"Directory not found: {source_dir}"}
@@ -231,19 +315,91 @@ def detect(source_dir: str) -> dict:
         return {"status": "success", "dependencies": [], "agent": "detective",
                 "note": "No external dependencies found in source tree."}
 
-    # Resolve via apt-file
-    scan_summary = {}
-    if c_headers:
-        scan_summary["c_headers"] = resolve_c_headers(c_headers)
-    if py_modules:
-        scan_summary["python_modules"] = resolve_python_modules(py_modules)
-    if go_modules:
-        scan_summary["go_modules"] = go_modules
+    # Phase 1: resolve via apt-file
+    c_results  = resolve_c_headers(c_headers)  if c_headers  else {}
+    py_results = resolve_python_modules(py_modules) if py_modules else {}
 
-    # Ask LLM to reason over the results
-    deps = ask_llm_for_deps(scan_summary)
+    # Phase 2: per-item LLM calls (15s each, 3-min total budget)
+    print(f"  [*] Phase 2: asking AI per dependency ...", file=sys.stderr)
+    llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
+    raw_deps = resolve_with_llm(c_results, py_results, go_modules, llm_budget)
 
-    return {"status": "success", "dependencies": deps, "agent": "detective"}
+    # Phase 3: final deduplication LLM call
+    print(f"  [*] Phase 3: deduplicating {len(raw_deps)} candidates ...", file=sys.stderr)
+    deps = deduplicate_with_llm(raw_deps)
+
+    written_to = None
+    if write and deps:
+        written_to = _write_control(source_dir, deps)
+
+    return {"status": "success", "dependencies": deps, "agent": "detective",
+            "written_to": written_to}
+
+
+# ── debian/control writer ─────────────────────────────────────────────────────
+
+def _write_control(source_dir: str, deps: list[str]) -> str:
+    """
+    Write or update debian/control with the detected Build-Depends.
+
+    - If debian/control already exists, replaces the Build-Depends field.
+    - If it doesn't exist, creates a minimal template.
+    """
+    debian_dir  = os.path.join(source_dir, "debian")
+    control_path = os.path.join(debian_dir, "control")
+    os.makedirs(debian_dir, exist_ok=True)
+
+    build_depends = (
+        "debhelper-compat (= 13),\n "
+        + ",\n ".join(sorted(deps))
+    )
+
+    if os.path.isfile(control_path):
+        with open(control_path, encoding="utf-8") as fh:
+            content = fh.read()
+
+        if re.search(r"^Build-Depends:", content, re.MULTILINE):
+            # Replace existing Build-Depends field (may span multiple lines)
+            content = re.sub(
+                r"^Build-Depends:.*?(?=^\S|\Z)",
+                f"Build-Depends: {build_depends}\n",
+                content,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+        else:
+            # Insert after the Source: paragraph's Standards-Version line (or at top)
+            content = re.sub(
+                r"(^Standards-Version:.*$)",
+                rf"\1\nBuild-Depends: {build_depends}",
+                content,
+                flags=re.MULTILINE,
+                count=1,
+            )
+            if "Build-Depends:" not in content:
+                content = f"Build-Depends: {build_depends}\n\n" + content
+    else:
+        # Create a minimal debian/control template
+        pkg_name = os.path.basename(os.path.abspath(source_dir))
+        content = (
+            f"Source: {pkg_name}\n"
+            f"Section: misc\n"
+            f"Priority: optional\n"
+            f"Maintainer: FIXME <maintainer@example.com>\n"
+            f"Build-Depends: {build_depends}\n"
+            f"Standards-Version: 4.6.2\n"
+            f"Rules-Requires-Root: no\n"
+            f"\n"
+            f"Package: {pkg_name}\n"
+            f"Architecture: any\n"
+            f"Depends: ${{shlibs:Depends}}, ${{misc:Depends}}\n"
+            f"Description: FIXME short description\n"
+            f" FIXME long description.\n"
+        )
+
+    with open(control_path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+    return control_path
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -251,8 +407,8 @@ def detect(source_dir: str) -> dict:
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print("Usage: python3 agents/detective.py <source_dir>", file=sys.stderr)
+        print("Usage: python3 agents/detective.py <source_dir> [--write]", file=sys.stderr)
         sys.exit(1)
 
-    result = detect(args[0])
+    result = detect(args[0], write="--write" in args)
     print(json.dumps(result, indent=2))
