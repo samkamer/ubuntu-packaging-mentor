@@ -29,27 +29,145 @@ asciinema play demo/demo_personas.cast
 | **patch_manager** | 4 Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
 | **builder** | 5 Build | Runs `debuild -us -uc -b`; on failure uses AI to classify the error and recommend the recovery agent |
 
-### patch_manager — Quilt Patch Workflow
+---
+
+### 1 · auditor — DEP-5 Copyright File
+
+Runs `licensecheck -r --copyright` on the source tree, normalises each raw license string to a valid DEP-5 SPDX identifier (via LLM with regex fallback), groups files by `(license, copyright)`, and emits a ready-to-use `debian/copyright`.
 
 ```bash
-# Dry run — preview the diff without touching files
+# Print to stdout
+python3 agents/auditor.py <source_dir>
+
+# Write to debian/copyright
+python3 agents/auditor.py <source_dir> --write
+```
+
+**Returns:**
+
+```json
+{
+  "status": "success",
+  "data": "Format: https://www.debian.org/...\n...",
+  "agent": "auditor",
+  "written_to": "path/to/debian/copyright",
+  "backed_up": null
+}
+```
+
+Requires `licensecheck`: `sudo apt install licensecheck`
+
+---
+
+### 2 · detective — Build-Depends Scanner
+
+Walks the source tree scanning `#include` directives (C/C++), Python imports, and Go `go.mod` requires. Resolves each header/module to its Ubuntu `-dev` package via `apt-file`, then asks the LLM to consolidate and format the final `Build-Depends` list.
+
+```bash
+# Print detected dependencies
+python3 agents/detective.py <source_dir>
+
+# Write to debian/control (appends Build-Depends field)
+python3 agents/detective.py <source_dir> --write
+```
+
+**Returns:**
+
+```json
+{
+  "status": "success",
+  "dependencies": ["libssl-dev", "zlib1g-dev"],
+  "agent": "detective",
+  "written_to": null
+}
+```
+
+Requires `apt-file`: `sudo apt install apt-file && sudo apt-file update`
+
+---
+
+### 3 · scribe — Changelog Drafter
+
+Reads up to 30 git commit messages from the source tree, sends them to the LLM to produce a properly formatted `debian/changelog` stanza. Falls back to a Python-built stub if git history is absent or the LLM response is malformed.
+
+```bash
+# Print changelog entry
+python3 agents/scribe.py <source_dir>
+
+# Target a specific release suite (default: noble)
+python3 agents/scribe.py <source_dir> jammy
+
+# Prepend to debian/changelog
+python3 agents/scribe.py <source_dir> noble --write
+```
+
+**Returns:**
+
+```json
+{
+  "status": "success",
+  "data": "hello (2.10-2) noble; urgency=medium\n\n  * ...\n\n -- ...\n",
+  "agent": "scribe",
+  "written_to": "path/to/debian/changelog",
+  "backed_up": null
+}
+```
+
+Maintainer name/email read from `DEBFULLNAME` / `DEBEMAIL` env vars, then `git config`.
+
+---
+
+### 4 · patch_manager — Quilt Patch Workflow
+
+Asks the LLM to identify which source file needs changing, generate a unified diff, then runs the full quilt workflow (`quilt new` → `quilt add` → `patch -p1` → `quilt refresh`). The resulting patch lands in `debian/patches/`.
+
+```bash
+# Dry run — preview the LLM diff without touching any files
 python3 agents/patch_manager.py <source_dir> <patch-name> "<description>" --dry-run
 
 # Apply for real
-python3 agents/patch_manager.py <source_dir> <patch-name> "<description>"
+python3 agents/patch_manager.py <source_dir> fix-greeting-logic "Fix the greeting to say Hello"
+```
+
+**Success:**
+
+```json
+{
+  "status": "success",
+  "patch": "fix-greeting-logic.patch",
+  "file": "src/hello.c",
+  "patch_path": "debian/patches/fix-greeting-logic.patch",
+  "agent": "patch_manager",
+  "written_to": "path/to/debian/patches/fix-greeting-logic.patch"
+}
+```
+
+**Dry run:**
+
+```json
+{
+  "status": "dry_run",
+  "patch": "fix-greeting-logic",
+  "file": "src/hello.c",
+  "diff": "--- a/src/hello.c\n+++ b/src/hello.c\n...",
+  "agent": "patch_manager",
+  "written_to": null
+}
 ```
 
 Requires `quilt` and `patch`: `sudo apt install quilt patch`
 
-### builder — Debian Build + AI Failure Analysis
+---
+
+### 5 · builder — Debian Build + AI Failure Analysis
+
+Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`. On failure, extracts the last 20 lines of the build log, sends them to the LLM for classification, and returns the suggested recovery agent and command.
 
 ```bash
 python3 agents/builder.py <source_dir>
 ```
 
-Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`.
-
-**Success** — returns and prints:
+**Success:**
 
 ```json
 {
@@ -60,7 +178,7 @@ Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`.
 }
 ```
 
-**Failure** — the builder extracts the last 20 lines of the build log, sends them to the LLM for classification, and returns a recovery suggestion:
+**Failure:**
 
 ```json
 {
