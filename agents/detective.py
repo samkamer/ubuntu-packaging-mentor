@@ -32,8 +32,48 @@ from agents.brain import ask
 
 # ── Language detection / scanning ─────────────────────────────────────────────
 
-C_EXTS    = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"}
-PY_EXTS   = {".py"}
+C_EXTS  = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp"}
+PY_EXTS = {".py"}
+
+# Directories to skip — tests, docs, build artefacts, vendored Windows shims
+_SKIP_DIRS = {
+    "test", "tests", "t", "check",          # test suites
+    "docs", "doc", "documentation",          # docs
+    "examples", "example", "demo", "demos",  # examples
+    "m4", "aclocal",                         # autoconf macros
+    "autom4te.cache", ".git",               # vcs / build cache
+    "win32", "windows", "win",               # Windows-specific source
+    "macos", "osx", "darwin",                # macOS-specific source
+    "vms", "os2", "amiga", "msdos",          # other legacy platforms
+}
+
+# Non-Linux platform header prefixes — skip these entirely
+_PLATFORM_SKIP = re.compile(r"""
+    ^(
+      # Windows
+      windows\.h | winsock | winldap | winber | schnlsp | sspi\.h |
+      schannel | tlhelp | tchar | winapifamily | winerror | subauth |
+      rpc\.h | direct\.h | conio\.h | share\.h | io\.h | excpt\.h |
+      bcrypt\.h | security\.h | iphlpapi\.h | Iphlpapi\.h |
+      # macOS / Darwin
+      Security/ | mach/ | SystemConfiguration/ | ConditionalMacros |
+      TargetConditionals | CoreFoundation | CommonCrypto/ |
+      # VMS / IBM i
+      descrip\.h | lnmdef | libclidef | miptrnam | stsdef | qadrt |
+      qsoasync | fabdef | mih/ | libio/ | milib | unixlib |
+      # AmigaOS / BeOS
+      proto/ | bsdsocket | amitcp |
+      # OS/2 / DOS / RISCOS
+      os2\.h | dos\.h | unixlib |
+      # Generic C runtime headers we can ignore (always available via libc-dev)
+      assert\.h | ctype\.h | errno\.h | float\.h | limits\.h | locale\.h |
+      math\.h | setjmp\.h | signal\.h | stdarg\.h | stddef\.h | stdio\.h |
+      stdlib\.h | string\.h | time\.h | wchar\.h | wctype\.h |
+      stdint\.h | inttypes\.h | stdbool\.h | stdatomic\.h | uchar\.h |
+      # C++ STL
+      string$ | cstdlib | cstring
+    )
+""", re.VERBOSE | re.IGNORECASE)
 
 # Python stdlib module names (3.11+)
 try:
@@ -53,27 +93,64 @@ _STDLIB_FALLBACK = {
     "importlib", "pkgutil", "platform", "stat", "glob", "fnmatch",
 }
 
+# Build system files and the tool they imply
+_BUILD_SYSTEM_FILES = {
+    "configure.ac":  ["autoconf", "automake", "libtool"],
+    "configure.in":  ["autoconf", "automake"],
+    "Makefile.am":   ["automake"],
+    "CMakeLists.txt": ["cmake"],
+    "meson.build":   ["meson", "ninja-build"],
+    "setup.py":      ["python3-setuptools"],
+    "setup.cfg":     ["python3-setuptools"],
+    "pyproject.toml": ["python3-build"],
+    "SConstruct":    ["scons"],
+    "wscript":       ["waf"],
+}
+
 
 def _is_stdlib(module: str) -> bool:
     return module in _STDLIB or module in _STDLIB_FALLBACK
 
 
+def _should_skip_dir(dirname: str) -> bool:
+    return dirname.lower() in _SKIP_DIRS or dirname.startswith(".")
+
+
+def scan_build_system(source_dir: str) -> list[str]:
+    """Detect build system tools from well-known config files at the source root."""
+    tools = []
+    for fname, pkgs in _BUILD_SYSTEM_FILES.items():
+        if os.path.isfile(os.path.join(source_dir, fname)):
+            tools.extend(pkgs)
+    # quilt: debian/patches/series
+    if os.path.isfile(os.path.join(source_dir, "debian", "patches", "series")):
+        tools.append("quilt")
+    return sorted(set(tools))
+
+
 def scan_c_headers(source_dir: str) -> set[str]:
-    """Extract unique #include <...> header paths from C/C++ source files."""
+    """Extract unique #include <...> header paths from C/C++ source files.
+
+    Skips platform-specific headers and non-Linux directories.
+    """
     headers = set()
     pattern = re.compile(r'#\s*include\s+<([^>]+)>')
-    for root, _, files in os.walk(source_dir):
+    for root, dirs, files in os.walk(source_dir):
+        # Prune skip dirs in-place so os.walk doesn't descend into them
+        dirs[:] = [d for d in dirs if not _should_skip_dir(d)]
         for fname in files:
             if os.path.splitext(fname)[1].lower() in C_EXTS:
                 path = os.path.join(root, fname)
                 try:
                     with open(path, encoding="utf-8", errors="replace") as fh:
                         for i, line in enumerate(fh):
-                            if i > 200:  # only scan file headers
+                            if i > 200:
                                 break
                             m = pattern.search(line)
                             if m:
-                                headers.add(m.group(1))
+                                header = m.group(1)
+                                if not _PLATFORM_SKIP.match(header):
+                                    headers.add(header)
                 except OSError:
                     pass
     return headers
@@ -82,7 +159,8 @@ def scan_c_headers(source_dir: str) -> set[str]:
 def scan_python_imports(source_dir: str) -> set[str]:
     """Extract unique third-party top-level module names from Python files."""
     modules = set()
-    for root, _, files in os.walk(source_dir):
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if not _should_skip_dir(d)]
         for fname in files:
             if os.path.splitext(fname)[1] in PY_EXTS:
                 path = os.path.join(root, fname)
@@ -304,15 +382,19 @@ def detect(source_dir: str, write: bool = False) -> dict:
 
     print(f"  [*] Scanning {source_dir} ...", file=sys.stderr)
 
-    c_headers  = scan_c_headers(source_dir)
-    py_modules = scan_python_imports(source_dir)
-    go_modules = scan_go_modules(source_dir)
+    c_headers    = scan_c_headers(source_dir)
+    py_modules   = scan_python_imports(source_dir)
+    go_modules   = scan_go_modules(source_dir)
+    build_tools  = scan_build_system(source_dir)
 
     print(f"  [*] Found: {len(c_headers)} C headers, "
           f"{len(py_modules)} Python modules, "
-          f"{len(go_modules)} Go modules", file=sys.stderr)
+          f"{len(go_modules)} Go modules, "
+          f"{len(build_tools)} build tools", file=sys.stderr)
+    if build_tools:
+        print(f"  [*] Build tools: {', '.join(build_tools)}", file=sys.stderr)
 
-    if not c_headers and not py_modules and not go_modules:
+    if not c_headers and not py_modules and not go_modules and not build_tools:
         return {"status": "success", "dependencies": [], "agent": "detective",
                 "note": "No external dependencies found in source tree."}
 
@@ -324,6 +406,9 @@ def detect(source_dir: str, write: bool = False) -> dict:
     print(f"  [*] Phase 2: asking AI per dependency ...", file=sys.stderr)
     llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
     raw_deps = resolve_with_llm(c_results, py_results, go_modules, llm_budget)
+
+    # Add build system tools directly (no LLM needed — deterministic)
+    raw_deps.extend(build_tools)
 
     # Phase 3: final deduplication LLM call
     print(f"  [*] Phase 3: deduplicating {len(raw_deps)} candidates ...", file=sys.stderr)
