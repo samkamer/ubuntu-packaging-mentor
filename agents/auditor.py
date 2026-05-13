@@ -2,125 +2,302 @@
 """
 agents/auditor.py — Legal/Copyright Auditor
 
-Runs `licensecheck -r --copyright .` inside a source directory, then uses
-Gemma to convert the raw output into a valid DEP-5 debian/copyright file.
+Pipeline:
+  1. Run `licensecheck -r --copyright .` inside the source directory
+  2. Parse output with Python into structured entries
+  3. Normalize each raw license string to a DEP-5 identifier via Gemma
+     (15 s timeout per call; falls back to regex if LLM is slow/unavailable)
+     Total LLM budget: 3 minutes — after that, regex-only for remaining files
+  4. Group files by (license, copyright) and generate a proper DEP-5 file
+  5. Return {"status": "success", "data": "<dep5 text>", "agent": "auditor"}
 
 Usage:
     python3 agents/auditor.py <source_dir> [--write]
 
 Flags:
-    --write   Write the generated copyright file to <source_dir>/debian/copyright
+    --write   Write the file to <source_dir>/debian/copyright
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import date
 
-# Ensure project root is on sys.path when script is run directly
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.brain import ask_gemma
+from agents.brain import ask
+
+# ── DEP-5 / SPDX known identifiers ───────────────────────────────────────────
+
+VALID_DEP5_IDS = {
+    "AFL-2.1", "AGPL-3", "AGPL-3+", "Apache-2.0", "Artistic", "Artistic-2.0",
+    "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "BSL-1.0", "CC0-1.0",
+    "CC-BY-4.0", "CC-BY-SA-4.0", "CDDL", "CPL-1.0", "EPL-1.0", "EPL-2.0",
+    "EUPL-1.1", "Expat", "FSFAP", "FSFUL", "FSFULLR",
+    "GFDL-1.1", "GFDL-1.1+", "GFDL-1.2", "GFDL-1.2+", "GFDL-1.3", "GFDL-1.3+",
+    "GPL", "GPL-1", "GPL-1+", "GPL-2", "GPL-2+", "GPL-3", "GPL-3+",
+    "ISC", "LGPL-2", "LGPL-2+", "LGPL-2.1", "LGPL-2.1+", "LGPL-3", "LGPL-3+",
+    "LPPL-1.3c", "MIT", "MIT-0", "MPL-1.1", "MPL-2.0", "MS-PL", "MS-RL",
+    "public-domain", "Python-2.0", "Ruby", "Unlicense", "UNKNOWN",
+    "W3C", "X11", "Zlib", "ZPL-2.0",
+}
+
+LLM_TIMEOUT_PER_CALL = 15    # seconds per individual license-normalization call
+LLM_BUDGET_SECONDS   = 180   # total LLM budget for the whole audit run
+
+
+def _is_valid_dep5(identifier: str) -> bool:
+    parts = [p.strip() for p in re.split(r"\s+AND\s+|\s+OR\s+", identifier)]
+    return all(p in VALID_DEP5_IDS for p in parts)
+
 
 # ── licensecheck ──────────────────────────────────────────────────────────────
 
 def run_licensecheck(source_dir: str) -> str:
-    """Run `licensecheck -r --copyright .` inside source_dir; return raw output."""
     result = subprocess.run(
         ["licensecheck", "-r", "--copyright", "."],
-        capture_output=True,
-        text=True,
-        cwd=source_dir,
+        capture_output=True, text=True, cwd=source_dir,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "licensecheck exited non-zero")
     return result.stdout
 
 
-# ── Gemma: DEP-5 generation ───────────────────────────────────────────────────
+# ── Parsing ───────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
-You are an Ubuntu packaging expert. You will receive the raw output of \
-`licensecheck -r --copyright` run on a source tree. Convert it into a valid \
-DEP-5 debian/copyright file (format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/).
+def parse_licensecheck_output(output: str) -> list[dict]:
+    """
+    Parse licensecheck -r --copyright output into structured entries.
 
-Rules:
-- Start with the mandatory Header paragraph (Format:, Upstream-Name:, Source:).
-- Group files sharing the same license and copyright into one Files stanza.
-- Use SPDX license identifiers wherever possible.
-- Use glob patterns (e.g. 'Files: *') to cover the whole tree where appropriate.
-- If a license is UNKNOWN, write 'License: UNKNOWN' and add a comment asking the packager to review.
-- Output ONLY the raw debian/copyright text — no markdown fences, no commentary.
-"""
+    Each block looks like:
+        ./path/to/file.c: GNU General Public License v3.0 or later
+          [Copyright: 2024 Some Author]
+    """
+    entries = []
+    current = None
+
+    for line in output.splitlines():
+        file_match = re.match(r"^(\./\S+):\s+(.+)$", line)
+        if file_match:
+            if current:
+                entries.append(current)
+            current = {
+                "file": file_match.group(1),
+                "license": file_match.group(2).strip(),
+                "copyrights": [],
+            }
+        elif current:
+            copy_match = re.match(r"^\s+\[Copyright:\s*(.*?)\s*\]$", line)
+            if copy_match:
+                text = copy_match.group(1).strip()
+                if text:
+                    current["copyrights"].append(text)
+
+    if current:
+        entries.append(current)
+    return entries
 
 
-def generate_dep5(raw_output: str, package_name: str) -> str:
-    """Ask Gemma to produce a DEP-5 file from raw licensecheck output."""
-    user_prompt = (
-        f"Package name: {package_name}\n\n"
-        f"Raw licensecheck output:\n{raw_output}"
+# ── License normalisation ─────────────────────────────────────────────────────
+
+def _regex_fallback(raw: str) -> str:
+    """Map a raw license string to a DEP-5 identifier using regex only."""
+    cleaned = re.sub(r"\s*\[generated file\]", "", raw, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^\*No copyright\*\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s+and/or\s+", " AND ", cleaned, flags=re.IGNORECASE)
+
+    if " AND " in cleaned:
+        return " AND ".join(_regex_fallback(p.strip()) for p in cleaned.split(" AND "))
+
+    n = cleaned.lower()
+    mappings = [
+        (r"gnu general public license v?3.*or later",           "GPL-3+"),
+        (r"gnu general public license v?3",                     "GPL-3"),
+        (r"gnu general public license v?2.*or later",           "GPL-2+"),
+        (r"gnu general public license v?2",                     "GPL-2"),
+        (r"gnu general public license",                         "GPL"),
+        (r"gnu lesser general public license v?3.*or later",    "LGPL-3+"),
+        (r"gnu lesser general public license v?3",              "LGPL-3"),
+        (r"gnu lesser general public license v?2\.1.*or later", "LGPL-2.1+"),
+        (r"gnu lesser general public license v?2\.1",           "LGPL-2.1"),
+        (r"gnu lesser general public license v?2.*or later",    "LGPL-2+"),
+        (r"gnu lesser general public license v?2",              "LGPL-2"),
+        (r"gnu free documentation license v?1\.3.*or later",    "GFDL-1.3+"),
+        (r"gnu free documentation license v?1\.3",              "GFDL-1.3"),
+        (r"gnu free documentation license v?1\.2.*or later",    "GFDL-1.2+"),
+        (r"gnu free documentation license v?1\.2",              "GFDL-1.2"),
+        (r"fsf unlimited license.*retention",                   "FSFULLR"),
+        (r"fsf unlimited license",                              "FSFUL"),
+        (r"fsf all permissive",                                 "FSFAP"),
+        (r"apache.*2",                                          "Apache-2.0"),
+        (r"mit",                                                "MIT"),
+        (r"x11",                                                "X11"),
+        (r"isc",                                                "ISC"),
+        (r"bsd.?2.?clause|simplified bsd",                      "BSD-2-Clause"),
+        (r"bsd.?3.?clause|new bsd",                             "BSD-3-Clause"),
+        (r"mpl.*2",                                             "MPL-2.0"),
+        (r"public.?domain",                                     "public-domain"),
+        (r"unknown",                                            "UNKNOWN"),
+    ]
+    for pattern, dep5_id in mappings:
+        if re.search(pattern, n):
+            return dep5_id
+    return cleaned if cleaned else "UNKNOWN"
+
+
+def _call_llm(raw: str) -> str:
+    """Ask the configured AI provider to map a raw license string to a DEP-5 identifier."""
+    system = "You are a Debian packaging expert."
+    user = (
+        "Map the following raw license string to a valid DEP-5 machine-readable "
+        "license identifier (e.g. GPL-2+, MIT, Apache-2.0).\n"
+        "Rules:\n"
+        "- Reply with ONLY the short DEP-5 identifier, nothing else.\n"
+        "- If multiple licenses, join with ' AND ' (e.g. GPL-2+ AND LGPL-2.1+).\n"
+        "- If truly unknown, reply: UNKNOWN\n\n"
+        f"Raw license string: {raw}\n"
+        "DEP-5 identifier:"
     )
-    return ask_gemma(_SYSTEM_PROMPT, user_prompt, label="Generating DEP-5 copyright file")
+    # label="" suppresses the spinner — auditor shows its own per-file progress
+    result = ask(system, user, label="", timeout=LLM_TIMEOUT_PER_CALL)
+    return result.strip().split("\n")[0].strip()
+
+
+def reason_license(raw: str, llm_budget: dict) -> str:
+    """
+    Normalize a raw license string to a DEP-5 identifier.
+    Tries the configured AI provider first (with per-call and total budget timeouts),
+    then falls back to regex.
+    llm_budget is a mutable dict {"remaining": float} shared across the run.
+    """
+    if llm_budget["remaining"] > 0:
+        t0 = time.time()
+        try:
+            result = _call_llm(raw)
+            elapsed = time.time() - t0
+            llm_budget["remaining"] -= elapsed
+            if result and _is_valid_dep5(result):
+                return result
+            if result:
+                print(f"  [~] AI returned unknown id {result!r} for {raw!r} — using regex",
+                      file=sys.stderr)
+        except (RuntimeError, OSError, KeyError, json.JSONDecodeError):
+            llm_budget["remaining"] -= (time.time() - t0)
+    else:
+        print("  [~] LLM budget exhausted — using regex fallback", file=sys.stderr)
+
+    return _regex_fallback(raw)
+
+
+# ── Grouping ──────────────────────────────────────────────────────────────────
+
+def group_by_license(entries: list[dict], llm_budget: dict) -> dict:
+    unique_licenses = list({e["license"] for e in entries})
+    total = len(unique_licenses)
+    print(f"  Normalising {total} unique license string(s) ...", file=sys.stderr)
+
+    # Normalise each unique license string once
+    cache = {}
+    for i, raw in enumerate(unique_licenses, 1):
+        label = f"  [{i}/{total}] {raw[:60]}"
+        dep5_id = reason_license(raw, llm_budget)
+        method = "llm" if llm_budget["remaining"] > 0 else "regex"
+        print(f"{label} → {dep5_id}", file=sys.stderr)
+        cache[raw] = dep5_id
+
+    # Group files
+    groups: dict = {}
+    for entry in entries:
+        dep5_id = cache[entry["license"]]
+        key = (dep5_id, frozenset(entry["copyrights"]))
+        if key not in groups:
+            groups[key] = {"files": [], "license": dep5_id, "copyrights": entry["copyrights"]}
+        groups[key]["files"].append(entry["file"])
+
+    return groups
+
+
+# ── DEP-5 generation ──────────────────────────────────────────────────────────
+
+def build_dep5(groups: dict, source_name: str) -> str:
+    lines = []
+    year = date.today().year
+
+    lines += [
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+        f"Upstream-Name: {source_name}",
+        "Upstream-Contact: FIXME <maintainer@example.com>",
+        f"Source: {source_name}",
+        "",
+    ]
+
+    seen_licenses = []
+    for info in groups.values():
+        dep5_id = info["license"]
+        files_glob = " ".join(sorted(info["files"])) if info["files"] else "*"
+        copyrights = sorted(info["copyrights"]) or [f"{year} FIXME <upstream>"]
+
+        lines.append(f"Files: {files_glob}")
+        for cp in copyrights:
+            lines.append(f"Copyright: {cp}")
+        lines.append(f"License: {dep5_id}")
+        lines.append("")
+
+        if dep5_id not in seen_licenses:
+            seen_licenses.append(dep5_id)
+
+    for dep5_id in seen_licenses:
+        lines.append(f"License: {dep5_id}")
+        lines.append(f" Full license text available at:")
+        lines.append(f" https://spdx.org/licenses/{dep5_id}.html")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 # ── Main audit function ───────────────────────────────────────────────────────
 
 def audit(source_dir: str, write: bool = False) -> dict:
-    """
-    Full audit pipeline. Returns a JSON-serialisable result dict:
-      {"status": "success", "data": "<dep5 text>", "agent": "auditor"}
-    or on error:
-      {"status": "error",   "data": None, "agent": "auditor", "error": "<msg>"}
-    """
-    # Req 6a: check directory exists
     if not os.path.isdir(source_dir):
-        return {
-            "status": "error",
-            "data": None,
-            "agent": "auditor",
-            "error": f"Directory not found: {source_dir}",
-        }
+        return {"status": "error", "data": None, "agent": "auditor",
+                "error": f"Directory not found: {source_dir}"}
 
-    # Req 6b: check licensecheck is installed
     if shutil.which("licensecheck") is None:
-        return {
-            "status": "error",
-            "data": None,
-            "agent": "auditor",
-            "error": "licensecheck is not installed. Run: sudo apt install licensecheck",
-        }
+        return {"status": "error", "data": None, "agent": "auditor",
+                "error": "licensecheck not installed. Run: sudo apt install licensecheck"}
 
-    package_name = os.path.basename(os.path.abspath(source_dir))
+    source_name = os.path.basename(os.path.abspath(source_dir))
 
-    # Req 2: run inside the directory
+    print("  [*] Running licensecheck ...", file=sys.stderr)
     try:
         raw_output = run_licensecheck(source_dir)
     except RuntimeError as e:
         return {"status": "error", "data": None, "agent": "auditor", "error": str(e)}
 
-    # Req 3/4: send raw output to Gemma for DEP-5 conversion
-    try:
-        dep5_text = generate_dep5(raw_output, package_name)
-    except RuntimeError as e:
-        return {"status": "error", "data": None, "agent": "auditor", "error": str(e)}
+    entries = parse_licensecheck_output(raw_output)
+    if not entries:
+        return {"status": "error", "data": None, "agent": "auditor",
+                "error": "No license/copyright information found in source tree."}
 
-    # Optional: write to debian/copyright
+    print(f"  [*] Found {len(entries)} file(s). Resolving license identifiers ...", file=sys.stderr)
+    llm_budget = {"remaining": float(LLM_BUDGET_SECONDS)}
+    groups = group_by_license(entries, llm_budget)
+
+    dep5_text = build_dep5(groups, source_name)
+
     written_to = None
     if write:
         debian_dir = os.path.join(source_dir, "debian")
         os.makedirs(debian_dir, exist_ok=True)
         written_to = os.path.join(debian_dir, "copyright")
-        with open(written_to, "w") as fh:
+        with open(written_to, "w", encoding="utf-8") as fh:
             fh.write(dep5_text)
 
-    # Req 5: return the specified JSON shape
-    return {
-        "status": "success",
-        "data": dep5_text,
-        "agent": "auditor",
-        "written_to": written_to,
-    }
+    return {"status": "success", "data": dep5_text, "agent": "auditor", "written_to": written_to}
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

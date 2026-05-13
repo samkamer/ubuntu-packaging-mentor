@@ -7,8 +7,9 @@ import json
 import os
 import sys
 
-from agents.brain import ask_gemma
+from agents.brain import ask
 from agents.auditor import audit as run_audit
+from agents.detective import detect as run_detect
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -160,7 +161,7 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         f"Target directory: {target}"
     )
     try:
-        explanation = ask_gemma(persona["system_prompt"], user_prompt, label=f"Gemma explaining {skill['name']}")
+        explanation = ask(persona["system_prompt"], user_prompt, label=f"Asking AI: {skill['name']}")
         print(f"\n{c(GREEN, '[' + persona['name'] + ']')} {explanation.strip()}\n")
     except RuntimeError as e:
         print(c(RED, f"  [brain] {e}"))
@@ -170,6 +171,8 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
     if skill["name"] == "Audit":
         write = prompt("Write debian/copyright to target directory? [y/N]:").lower() == "y"
         result = run_audit(target, write=write)
+    elif skill["name"] == "Detect":
+        result = run_detect(target)
     else:
         result = skill["mock_result"]
 
@@ -186,6 +189,14 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                 print(c(GREEN, f"\n✓ Written to: {result['written_to']}"))
             else:
                 print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
+        elif skill["name"] == "Detect" and result.get("dependencies") is not None:
+            deps = result["dependencies"]
+            if deps:
+                print(c(CYAN, "\n── Suggested Build-Depends ─────────────────────────"))
+                print("Build-Depends: " + ",\n               ".join(deps))
+                print(c(CYAN, "────────────────────────────────────────────────────"))
+            else:
+                print(c(YELLOW, "\nNo external dependencies detected."))
         else:
             print(json.dumps(result, indent=2))
 
