@@ -28,6 +28,7 @@ asciinema play demo/demo_personas.cast
 | **scribe** | 3&nbsp;Scribe | Reads git log → drafts a `debian/changelog` entry |
 | **patch_manager** | 4&nbsp;Patch | AI-identifies the file to change, generates a unified diff, applies it as a quilt patch in `debian/patches/` |
 | **builder** | 5&nbsp;Build | Runs `debuild -us -uc -b`; on failure uses AI to classify the error and recommend the recovery agent |
+| **linter** | — | Runs `lintian` on a `.changes` or `.deb`; AI explains any `E:` errors. Called automatically by builder after a successful build |
 
 ---
 
@@ -161,24 +162,39 @@ Requires `quilt` and `patch`: `sudo apt install quilt patch`
 
 ### 5 · builder — Debian Build + AI Failure Analysis
 
-Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`. On failure, extracts the last 20 lines of the build log, sends them to the LLM for classification, and returns the suggested recovery agent and command.
+Runs `debuild -us -uc -b` (unsigned binary build) inside `<source_dir>`. On success, automatically calls the **linter** agent on the generated `.changes` file. On build failure, extracts the last 20 lines of the build log, sends them to the LLM for classification, and returns the suggested recovery agent and command.
 
 ```bash
 python3 agents/builder.py <source_dir>
 ```
 
-**Success:**
+**Success (no lintian errors):**
 
 ```json
 {
   "status": "success",
   "message": "Package built successfully.",
   "log_lines": 42,
+  "lintian": {"status": "success", "errors": [], "warnings": [...], "agent": "linter"},
   "agent": "builder"
 }
 ```
 
-**Failure:**
+**Success (lintian errors found — status flips to error):**
+
+```json
+{
+  "status": "error",
+  "error_type": "lintian",
+  "suggested_agent": "auditor",
+  "suggested_command": "python3 agents/auditor.py <source_dir> --write",
+  "analysis": "...",
+  "lintian": {"status": "error", "errors": [{"tag": "no-copyright-file", ...}], ...},
+  "agent": "builder"
+}
+```
+
+**Build failure:**
 
 ```json
 {
@@ -197,9 +213,56 @@ python3 agents/builder.py <source_dir>
 | Missing `-dev` package / unmet build deps | `dpkg-checkbuilddeps` output | `detective` |
 | Compilation or syntax error | `make` / compiler output | `patch_manager` |
 | Packaging file problem | `dh_*` / `dpkg-source` output | `auditor` |
+| Lintian `E:` errors in built package | lintian output | `auditor` |
 | Unknown | LLM fallback | `detective` |
 
-Requires `debuild`: `sudo apt install devscripts`
+Requires `debuild` and `lintian`: `sudo apt install devscripts lintian`
+
+---
+
+### 6 · linter — Lintian Policy Checker
+
+Runs `lintian` on a `.changes` file (preferred) or `.deb`, suppresses known-noisy tags, and uses the LLM to explain any remaining `E:` errors and suggest fixes. Called automatically by builder, but can also be run standalone on any pre-built package.
+
+```bash
+python3 agents/linter.py <path/to/package.changes>
+python3 agents/linter.py <path/to/package.deb>
+```
+
+**Clean package:**
+
+```json
+{
+  "status": "success",
+  "errors": [],
+  "warnings": [{"tag": "no-manual-page", "detail": "usr/bin/tool"}],
+  "analysis": null,
+  "error_type": "lintian",
+  "agent": "linter"
+}
+```
+
+**Package with errors:**
+
+```json
+{
+  "status": "error",
+  "errors": [{"tag": "no-copyright-file", "detail": ""}],
+  "warnings": [],
+  "analysis": "no-copyright-file: debian/copyright is missing...",
+  "error_type": "lintian",
+  "agent": "linter"
+}
+```
+
+| Severity | Meaning | Effect on status |
+|----------|---------|-----------------|
+| `E:` error | Debian Policy violation | `status: error`, LLM analysis triggered |
+| `W:` warning | Recommended practice not followed | `status: success`, listed under `warnings` |
+
+Suppressed by default: `initial-upload-closes-no-bugs`, `groff-message`, `debian-watch-file-is-missing`
+
+Requires `lintian`: `sudo apt install lintian`
 
 ## Persona levels
 
