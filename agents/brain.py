@@ -356,6 +356,19 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             "Run auditor to review and regenerate the debian/ metadata files."
         )
 
+    # ── linter internals ──────────────────────────────────────────────────────
+    if "lintian errors" in up or "lintian error tags" in up:
+        return (
+            "The following lintian errors indicate packaging policy violations:\n\n"
+            "E: no-copyright-file\n"
+            "  Fix: ensure debian/copyright exists and is valid DEP-5 format.\n"
+            "  Run: python3 agents/auditor.py <source_dir> --write\n\n"
+            "E: bad-distribution-in-changes-file\n"
+            "  Fix: correct the distribution name in debian/changelog.\n"
+            "  Run: python3 agents/scribe.py <source_dir> --write\n\n"
+            "Address these by re-running the relevant agents before uploading."
+        )
+
     return "Task completed."
 
 

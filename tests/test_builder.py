@@ -169,7 +169,7 @@ class TestBuildPublicApi:
         assert len(result["log_tail"].splitlines()) <= LOG_TAIL_LINES + 1
 
     def test_success_result_structure(self, tmp_path, monkeypatch):
-        """Simulate a successful debuild."""
+        """Simulate a successful debuild with no .changes file found (lintian skipped)."""
         monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
         import agents.builder as builder_mod
@@ -177,11 +177,58 @@ class TestBuildPublicApi:
             builder_mod, "run_debuild",
             lambda d: (0, "dpkg-deb: building package 'hello' in '../hello_1.0_amd64.deb'\n"),
         )
+        # No .changes file exists → lintian is skipped, lintian key is None
+        monkeypatch.setattr(builder_mod, "_find_changes_file", lambda d, l: None)
         result = build(str(tmp_path))
         assert result["status"] == "success"
         assert result["message"] == "Package built successfully."
         assert "log_lines" in result
         assert result["agent"] == "builder"
+        assert "lintian" in result
+
+    def test_success_with_clean_lintian(self, tmp_path, monkeypatch):
+        """Simulate a successful build where lintian also passes."""
+        monkeypatch.setenv("AI_PROVIDER", "demo")
+        (tmp_path / "debian").mkdir()
+        changes = tmp_path.parent / "foo_1.0_amd64.changes"
+        changes.write_text("")
+        import agents.builder as builder_mod
+        import agents.linter as linter_mod
+        monkeypatch.setattr(
+            builder_mod, "run_debuild",
+            lambda d: (0, "dpkg-genchanges: ...\n"),
+        )
+        monkeypatch.setattr(
+            builder_mod, "_find_changes_file",
+            lambda d, l: str(changes),
+        )
+        monkeypatch.setattr(
+            linter_mod, "run_lintian",
+            lambda t: (0, "", ""),
+        )
+        result = build(str(tmp_path))
+        assert result["status"] == "success"
+        assert result["lintian"]["status"] == "success"
+
+    def test_success_with_lintian_errors_flips_status(self, tmp_path, monkeypatch):
+        """Build succeeds but lintian finds errors → overall status becomes error."""
+        monkeypatch.setenv("AI_PROVIDER", "demo")
+        (tmp_path / "debian").mkdir()
+        changes = tmp_path.parent / "foo_1.0_amd64.changes"
+        changes.write_text("")
+        import agents.builder as builder_mod
+        import agents.linter as linter_mod
+        monkeypatch.setattr(builder_mod, "run_debuild", lambda d: (0, ""))
+        monkeypatch.setattr(builder_mod, "_find_changes_file", lambda d, l: str(changes))
+        monkeypatch.setattr(
+            linter_mod, "run_lintian",
+            lambda t: (1, "E: foo: no-copyright-file\n", ""),
+        )
+        result = build(str(tmp_path))
+        assert result["status"] == "error"
+        assert result["error_type"] == "lintian"
+        assert result["lintian"]["errors"][0]["tag"] == "no-copyright-file"
+        assert result["suggested_agent"] == "auditor"
 
     def test_log_tail_capped_at_constant(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AI_PROVIDER", "demo")

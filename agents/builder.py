@@ -16,6 +16,7 @@ Usage:
     python3 agents/builder.py <source_dir>
 """
 
+import glob as _glob
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.brain import ask, llm_budget_seconds
+from agents.linter import lint
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -217,6 +219,37 @@ def _regex_recovery(error_type: str, source_dir: str, reason: str) -> dict:
     }
 
 
+# ── .changes finder ───────────────────────────────────────────────────────────
+
+def _find_changes_file(source_dir: str, build_log: str) -> str | None:
+    """
+    Find the .changes file produced by debuild.
+
+    Strategy (in order of preference):
+      1. Parse debuild stdout for a line mentioning a .changes file.
+      2. Glob the parent directory for *.changes sorted by mtime (newest).
+    """
+    # 1. Parse build log — dpkg-genchanges prints the path
+    for line in build_log.splitlines():
+        if line.strip().endswith(".changes"):
+            candidate = line.strip()
+            # Path may be relative to source_dir's parent
+            if not os.path.isabs(candidate):
+                candidate = os.path.normpath(
+                    os.path.join(os.path.dirname(os.path.abspath(source_dir)), candidate)
+                )
+            if os.path.isfile(candidate):
+                return candidate
+
+    # 2. Glob parent dir for any .changes files
+    parent = os.path.dirname(os.path.abspath(source_dir))
+    candidates = _glob.glob(os.path.join(parent, "*.changes"))
+    if candidates:
+        return max(candidates, key=os.path.getmtime)
+
+    return None
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def build(source_dir: str) -> dict:
@@ -253,12 +286,40 @@ def build(source_dir: str) -> dict:
 
     if returncode == 0:
         print("  [✓] Build succeeded", file=sys.stderr)
-        return {
+        changes_file = _find_changes_file(source_dir, full_log)
+
+        lintian_result = None
+        if changes_file:
+            lintian_result = lint(changes_file)
+        else:
+            print("  [~] Could not locate .changes file — skipping lintian",
+                  file=sys.stderr)
+
+        base = {
             "status":    "success",
             "message":   "Package built successfully.",
             "agent":     "builder",
             "log_lines": len(log_lines),
+            "lintian":   lintian_result,
         }
+
+        # Lintian errors flip the overall status but use a distinct error_type
+        # so mentor.py can distinguish build failures from lint failures.
+        if lintian_result and lintian_result.get("status") == "error":
+            print(
+                f"  [!] lintian found {len(lintian_result['errors'])} error(s) — "
+                "package needs fixes before upload",
+                file=sys.stderr,
+            )
+            base["status"]           = "error"
+            base["error_type"]       = "lintian"
+            base["analysis"]         = lintian_result.get("analysis")
+            base["suggested_agent"]  = "auditor"
+            base["suggested_command"] = (
+                f"python3 agents/auditor.py {source_dir} --write"
+            )
+
+        return base
 
     # Build failed — analyse and suggest recovery
     print(f"  [!] Build failed (exit {returncode}) — analysing error ...",
