@@ -1,0 +1,75 @@
+.TH UBU-DEV-MENTOR 1 "May 2026" "0.1.0" "Ubuntu AI Packaging Mentor"
+.SH NAME
+ubu-dev-mentor \- AI-powered CLI mentor for Ubuntu/Debian packaging
+.SH SYNOPSIS
+.B ubu-dev-mentor
+.SH DESCRIPTION
+.B ubu-dev-mentor
+is an interactive CLI tool that automates Debian/Ubuntu packaging tasks
+using a local LLM (Ollama/Gemma3 by default), with adaptive explanations
+tailored to three experience levels: Beginner, MOTU, and CoreDev.
+.PP
+It coordinates five agents:
+.TP
+.B auditor
+Scans the source tree with
+.BR licensecheck (1)
+and generates a DEP-5
+.I debian/copyright
+file.
+.TP
+.B detective
+Scans C/C++/Python/Go source for external dependencies and resolves them
+to Ubuntu
+.I Build-Depends
+package names via
+.BR apt-file (1).
+.TP
+.B scribe
+Reads git log and drafts a
+.I debian/changelog
+entry using the LLM.
+.TP
+.B patch_manager
+Identifies which source file needs changing, generates a unified diff,
+and applies it as a quilt patch in
+.IR debian/patches/ .
+.TP
+.B builder
+Runs
+.B debuild \-us \-uc \-b
+and, on failure, classifies the build error with the LLM and recommends
+the appropriate recovery agent.
+.SH ENVIRONMENT
+.TP
+.B AI_PROVIDER
+LLM backend to use:
+.B ollama
+(default),
+.B copilot
+, or
+.B demo
+(offline, no LLM required).
+.TP
+.B LLM_BUDGET
+Maximum seconds to spend on LLM calls per run (default: 180).
+.TP
+.B DEBFULLNAME
+Maintainer full name used by the scribe agent.
+.TP
+.B DEBEMAIL
+Maintainer e-mail address used by the scribe agent.
+.SH FILES
+.TP
+.I /usr/lib/python3/dist-packages/agents/
+Python modules for each packaging agent.
+.SH SEE ALSO
+.BR licensecheck (1),
+.BR apt-file (1),
+.BR debuild (1),
+.BR quilt (1),
+.BR lintian (1)
+.SH AUTHORS
+Ubuntu Packaging Mentor Contributors.
+.br
+Source: https://github.com/samkamer/ubuntu-packaging-mentor

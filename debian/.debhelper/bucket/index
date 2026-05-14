@@ -1,0 +1,4 @@
+cf610daf8afdedbf2110abd79bdd4121d59080cab5ec46deaf67f97273bb6bda lab/sources/curl-package/curl-8.18.0/config.guess
+47da33933b3825049bbc04871747a9598ce90fd45a438b6a8a58b74bf6d73a4d lab/sources/hello-package/hello-2.10/build-aux/config.guess
+deb02c26f43b2ea64276c9ede77ec0f53d08e6256710f3c0a12275712085c348 lab/sources/curl-package/curl-8.18.0/config.sub
+6adc41d8d507d6a5dd97847a592a0629292593d5d901a766b530246f4ce847aa lab/sources/hello-package/hello-2.10/build-aux/config.sub

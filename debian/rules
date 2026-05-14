@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Nothing to compile — pure Python
+
+override_dh_auto_install:
+	# Install mentor.py as the ubu-dev-mentor command
+	install -D -m 755 mentor.py \
+		debian/ubu-dev-mentor/usr/bin/ubu-dev-mentor
+	# Install the agents package
+	install -d debian/ubu-dev-mentor/usr/lib/python3/dist-packages/agents
+	install -m 644 agents/*.py \
+		debian/ubu-dev-mentor/usr/lib/python3/dist-packages/agents/
+	# Install man page
+	install -D -m 644 debian/ubu-dev-mentor.1 \
+		debian/ubu-dev-mentor/usr/share/man/man1/ubu-dev-mentor.1

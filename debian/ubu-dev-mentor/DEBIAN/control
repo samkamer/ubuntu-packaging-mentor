@@ -1,0 +1,21 @@
+Package: ubu-dev-mentor
+Version: 0.1.0-1
+Architecture: all
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+Installed-Size: 143
+Depends: python3
+Recommends: licensecheck, apt-file, devscripts, quilt, patch
+Section: devel
+Priority: optional
+Homepage: https://github.com/samkamer/ubuntu-packaging-mentor
+Description: AI-powered CLI mentor for Ubuntu/Debian packaging
+ Automates copyright auditing, build-dependency detection, and changelog
+ generation using a local LLM — with adaptive explanations for Beginner,
+ MOTU, and CoreDev experience levels.
+ .
+ Agents included:
+  * auditor     — generates DEP-5 debian/copyright via licensecheck
+  * detective   — resolves Build-Depends from C/Python/Go source headers
+  * scribe      — drafts debian/changelog entries from git log
+  * patch_manager — applies AI-generated quilt patches
+  * builder     — runs debuild and classifies build failures with AI

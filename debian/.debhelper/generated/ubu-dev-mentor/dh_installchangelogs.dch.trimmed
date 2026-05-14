@@ -1,0 +1,8 @@
+ubu-dev-mentor (0.1.0-1) resolute; urgency=medium
+
+  * Initial release.
+  * Five packaging agents: auditor, detective, scribe, patch_manager, builder.
+  * Adaptive mentorship for Beginner, MOTU, and CoreDev experience levels.
+  * Local LLM integration via Ollama (Gemma3); demo mode for offline use.
+
+ -- Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>  Thu, 14 May 2026 09:18:39 +0000
