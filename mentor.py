@@ -7,12 +7,15 @@ import json
 import os
 import sys
 
-from agents.brain import ask
-from agents.auditor import audit as run_audit
-from agents.detective import detect as run_detect
-from agents.scribe import scribe as run_scribe
-from agents.patch_manager import patch as run_patch
-from agents.builder import build as run_build
+# Agent imports are deferred until after config is loaded so that
+# os.environ is set correctly before agents.brain initialises.
+# These module-level names are populated in main() after config loading.
+ask        = None
+run_audit  = None
+run_detect = None
+run_scribe = None
+run_patch  = None
+run_build  = None
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -431,6 +434,54 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    import argparse
+    from agents import config as cfg
+    from agents.preflight import run_setup
+
+    parser = argparse.ArgumentParser(
+        description="Ubuntu AI Packaging Mentor",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--setup", action="store_true",
+        help="Re-detect environment and rewrite config, then exit.",
+    )
+    args = parser.parse_args()
+
+    # ── Preflight: first run or explicit --setup ──────────────────────────────
+    if args.setup or not cfg.exists():
+        run_setup(rerun=args.setup)
+        if args.setup:
+            return   # --setup just runs detection and exits
+
+    # ── Load config → populate env before brain import ───────────────────────
+    settings = cfg.load()
+    if settings.get("llm.provider"):
+        os.environ.setdefault("AI_PROVIDER", settings["llm.provider"])
+    if settings.get("llm.url"):
+        os.environ.setdefault("LLM_URL", settings["llm.url"])
+    if settings.get("llm.model"):
+        os.environ.setdefault("LLM_MODEL", settings["llm.model"])
+    if settings.get("llm.budget"):
+        os.environ.setdefault("LLM_BUDGET", settings["llm.budget"])
+
+    # ── Lazy agent imports (after env is set) ─────────────────────────────────
+    import mentor as _self
+    from agents.brain import ask as _ask
+    from agents.auditor import audit as _run_audit
+    from agents.detective import detect as _run_detect
+    from agents.scribe import scribe as _run_scribe
+    from agents.patch_manager import patch as _run_patch
+    from agents.builder import build as _run_build
+
+    # Populate module-level names used by run_skill / _persona_explain
+    _self.ask        = _ask
+    _self.run_audit  = _run_audit
+    _self.run_detect = _run_detect
+    _self.run_scribe = _run_scribe
+    _self.run_patch  = _run_patch
+    _self.run_build  = _run_build
+
     print(c(BOLD, BANNER))
 
     # 1. Persona selection

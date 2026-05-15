@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# Only show the first-run hint on a fresh install (not upgrades).
+if [ "$1" = "configure" ] && [ -z "$2" ]; then
+    printf "\n  ubu-dev-mentor installed.\n"
+    printf "  Run the following as your normal user to detect your environment:\n\n"
+    printf "    ubu-dev-mentor --setup\n\n"
+fi
+
+#DEBHELPER#
