@@ -486,8 +486,7 @@ def audit(source_dir: str, build_log: str | None = None) -> dict:
             build_log_checked = True
 
             if hardening_status == "unknown":
-                blhc_path = shutil.which("blhc")
-                if blhc_path is None:
+                if shutil.which("blhc") is None:
                     hardening_reason = "blhc_not_installed"
                 elif "timed out" in raw_blhc.lower():
                     hardening_reason = "blhc_timeout"

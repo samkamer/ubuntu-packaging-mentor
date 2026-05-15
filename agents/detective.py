@@ -879,11 +879,11 @@ def detect(source_dir: str, write: bool = False, backup: bool = False) -> dict:
     deps = deduplicate_with_llm(raw_deps, log=log)
 
     # Phase 4: build warnings from pipeline log
-    dep_set = set(deps)
+    deduplicated_deps_set = set(deps)
     competing_groups = _detect_competing_groups(pkg_to_headers)
     log.competing_groups = []
     for grp in competing_groups:
-        kept_packages = [pkg for pkg in grp["packages"] if pkg in dep_set]
+        kept_packages = [pkg for pkg in grp["packages"] if pkg in deduplicated_deps_set]
         if len(kept_packages) >= 2:
             log.competing_groups.append({
                 "namespace": grp["namespace"],
