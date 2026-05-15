@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents.auditor import (
     _is_valid_dep5,
     _regex_fallback,
+    _dominant_license,
+    _parse_debian_maintainers,
     parse_licensecheck_output,
     build_dep5,
 )
@@ -188,3 +190,139 @@ class TestBuildDep5:
         assert "FIXME" in dep5
         assert "and/or" in dep5
         assert "License: ISC or curl" in dep5
+
+    def test_files_star_catch_all_is_first_stanza(self):
+        dep5 = build_dep5(self._make_groups(), "mypkg")
+        # Files: * must appear before any other Files: stanza
+        lines = dep5.splitlines()
+        files_lines = [i for i, l in enumerate(lines) if l.startswith("Files:")]
+        assert files_lines, "No Files: stanza found"
+        assert lines[files_lines[0]] == "Files: *"
+
+    def test_files_star_uses_dominant_license(self):
+        groups = {
+            ("MIT", frozenset(["2024 Alice"])): {
+                "files": ["a.c", "b.c", "c.c"],
+                "license": "MIT",
+                "copyrights": ["2024 Alice"],
+                "ambiguous": False,
+            },
+            ("ISC", frozenset(["2024 Bob"])): {
+                "files": ["x.c"],
+                "license": "ISC",
+                "copyrights": ["2024 Bob"],
+                "ambiguous": False,
+            },
+        }
+        dep5 = build_dep5(groups, "mypkg")
+        # MIT covers 3 files vs ISC covers 1 — Files: * should use MIT
+        lines = dep5.splitlines()
+        star_idx = next(i for i, l in enumerate(lines) if l == "Files: *")
+        assert lines[star_idx + 2] == "License: MIT"
+
+    def test_debian_stanza_added_when_changelog_present(self, tmp_path):
+        debian = tmp_path / "debian"
+        debian.mkdir()
+        (debian / "changelog").write_text(
+            "mypkg (1.0) unstable; urgency=low\n\n"
+            "  * Initial release\n\n"
+            "-- Alice Dev <alice@example.com>  Mon, 01 Jan 2024 00:00:00 +0000\n\n"
+            "mypkg (0.9) unstable; urgency=low\n\n"
+            "  * Beta\n\n"
+            "-- Bob Maintainer <bob@example.com>  Tue, 01 Jan 2019 00:00:00 +0000\n"
+        )
+        dep5 = build_dep5(self._make_groups(), "mypkg", source_dir=str(tmp_path))
+        assert "Files: debian/*" in dep5
+        assert "Alice Dev <alice@example.com>" in dep5
+        assert "Bob Maintainer <bob@example.com>" in dep5
+
+    def test_no_debian_stanza_when_no_changelog(self, tmp_path):
+        dep5 = build_dep5(self._make_groups(), "mypkg", source_dir=str(tmp_path))
+        assert "Files: debian/*" not in dep5
+
+
+class TestDominantLicense:
+    def _groups(self):
+        return {
+            ("MIT", frozenset(["2024 Alice"])): {
+                "files": ["a.c", "b.c", "c.c"],
+                "license": "MIT",
+                "copyrights": ["2024 Alice"],
+                "ambiguous": False,
+            },
+            ("ISC", frozenset(["2024 Bob"])): {
+                "files": ["x.c"],
+                "license": "ISC",
+                "copyrights": ["2024 Bob"],
+                "ambiguous": False,
+            },
+        }
+
+    def test_returns_most_common_license(self):
+        dep5_id, _ = _dominant_license(self._groups())
+        assert dep5_id == "MIT"
+
+    def test_returns_primary_copyright(self):
+        _, copyrights = _dominant_license(self._groups())
+        assert any("Alice" in cp for cp in copyrights)
+
+    def test_et_al_when_multiple_holders(self):
+        groups = {
+            ("MIT", frozenset(["2024 Alice"])): {
+                "files": ["a.c"],
+                "license": "MIT",
+                "copyrights": ["2024 Alice"],
+                "ambiguous": False,
+            },
+            ("MIT", frozenset(["2024 Bob"])): {
+                "files": ["b.c"],
+                "license": "MIT",
+                "copyrights": ["2024 Bob"],
+                "ambiguous": False,
+            },
+        }
+        _, copyrights = _dominant_license(groups)
+        assert any("et al." in cp for cp in copyrights)
+
+
+class TestParseDebianMaintainers:
+    def test_extracts_single_maintainer(self, tmp_path):
+        debian = tmp_path / "debian"
+        debian.mkdir()
+        (debian / "changelog").write_text(
+            "pkg (1.0) unstable; urgency=low\n\n  * First\n\n"
+            "-- Alice Dev <alice@example.com>  Mon, 01 Jan 2024 00:00:00 +0000\n"
+        )
+        result = _parse_debian_maintainers(str(tmp_path))
+        assert len(result) == 1
+        assert "Alice Dev <alice@example.com>" in result[0]
+        assert "2024" in result[0]
+
+    def test_collapses_year_range(self, tmp_path):
+        debian = tmp_path / "debian"
+        debian.mkdir()
+        (debian / "changelog").write_text(
+            "pkg (1.1) unstable; urgency=low\n\n  * Update\n\n"
+            "-- Alice Dev <alice@example.com>  Mon, 01 Jan 2024 00:00:00 +0000\n\n"
+            "pkg (1.0) unstable; urgency=low\n\n  * Init\n\n"
+            "-- Alice Dev <alice@example.com>  Mon, 01 Jan 2020 00:00:00 +0000\n"
+        )
+        result = _parse_debian_maintainers(str(tmp_path))
+        assert len(result) == 1
+        assert "2020-2024" in result[0]
+
+    def test_multiple_maintainers(self, tmp_path):
+        debian = tmp_path / "debian"
+        debian.mkdir()
+        (debian / "changelog").write_text(
+            "pkg (1.1) unstable; urgency=low\n\n  * Update\n\n"
+            "-- Alice Dev <alice@example.com>  Mon, 01 Jan 2024 00:00:00 +0000\n\n"
+            "pkg (1.0) unstable; urgency=low\n\n  * Init\n\n"
+            "-- Bob Maint <bob@example.com>  Mon, 01 Jan 2019 00:00:00 +0000\n"
+        )
+        result = _parse_debian_maintainers(str(tmp_path))
+        assert len(result) == 2
+
+    def test_returns_empty_when_no_changelog(self, tmp_path):
+        result = _parse_debian_maintainers(str(tmp_path))
+        assert result == []

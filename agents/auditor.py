@@ -271,9 +271,76 @@ def group_by_license(entries: list[dict], llm_budget: dict) -> dict:
     return groups
 
 
+# ── Catch-all and debian/* helpers ───────────────────────────────────────────
+
+def _dominant_license(groups: dict) -> tuple[str, list[str]]:
+    """
+    Return (dep5_id, copyright_lines) for the license covering the most files.
+    Used to generate the mandatory 'Files: *' catch-all stanza.
+    """
+    counts: dict[str, int] = {}
+    for info in groups.values():
+        counts[info["license"]] = counts.get(info["license"], 0) + len(info["files"])
+
+    dominant_id = max(counts, key=counts.__getitem__)
+
+    # Collect all copyright holders for the dominant license, deduped, sorted.
+    copyrights: list[str] = []
+    for info in groups.values():
+        if info["license"] == dominant_id:
+            for cp in info["copyrights"]:
+                if cp not in copyrights:
+                    copyrights.append(cp)
+    copyrights.sort()
+
+    # Use first holder + "et al." if there are multiple — mirrors real-world practice.
+    if len(copyrights) > 1:
+        primary = [f"{copyrights[0]}, et al."]
+    else:
+        primary = copyrights or ["FIXME <upstream>"]
+
+    return dominant_id, primary
+
+
+def _parse_debian_maintainers(source_dir: str) -> list[str]:
+    """
+    Parse debian/changelog for maintainer entries.
+    Returns a list of 'YYYY[-YYYY], Name <email>' strings, one per unique maintainer,
+    with year ranges collapsed.  Returns [] if no changelog found.
+    """
+    changelog = os.path.join(source_dir, "debian", "changelog")
+    if not os.path.isfile(changelog):
+        return []
+
+    # Trailer lines look like: -- Name <email>  Weekday, DD Mon YYYY HH:MM:SS +TZ
+    trailer_re = re.compile(
+        r"^-- (.+? <[^>]+>)\s+\w+,\s+\d+\s+\w+\s+(\d{4})\s+"
+    )
+
+    maintainer_years: dict[str, list[int]] = {}
+    try:
+        with open(changelog, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = trailer_re.match(line)
+                if m:
+                    name_email = m.group(1).strip()
+                    year = int(m.group(2))
+                    maintainer_years.setdefault(name_email, []).append(year)
+    except OSError:
+        return []
+
+    result = []
+    for name_email, years in maintainer_years.items():
+        lo, hi = min(years), max(years)
+        yr = f"{lo}-{hi}" if lo != hi else str(lo)
+        result.append(f"{yr}, {name_email}")
+
+    return sorted(result)
+
+
 # ── DEP-5 generation ──────────────────────────────────────────────────────────
 
-def build_dep5(groups: dict, source_name: str) -> str:
+def build_dep5(groups: dict, source_name: str, source_dir: str = "") -> str:
     lines = []
     year = date.today().year
 
@@ -284,6 +351,27 @@ def build_dep5(groups: dict, source_name: str) -> str:
         f"Source: {source_name}",
         "",
     ]
+
+    # ── Mandatory Files: * catch-all (must be first Files: stanza) ────────────
+    dominant_id, dominant_copyrights = _dominant_license(groups)
+    lines.append("Files: *")
+    for cp in dominant_copyrights:
+        lines.append(f"Copyright: {cp}")
+    lines.append(f"License: {dominant_id}")
+    lines.append("")
+
+    # ── Files: debian/* — maintainers from debian/changelog ───────────────────
+    debian_maintainers = _parse_debian_maintainers(source_dir) if source_dir else []
+    if debian_maintainers:
+        lines.append("Files: debian/*")
+        for m in debian_maintainers:
+            lines.append(f"Copyright: {m}")
+        lines.append(f"License: {dominant_id}")
+        lines.append(
+            "# FIXME: verify the license for debian/* — it is often the same as"
+            " upstream but may differ."
+        )
+        lines.append("")
 
     seen_licenses = []
     for info in groups.values():
@@ -347,7 +435,7 @@ def audit(source_dir: str, write: bool = False, backup: bool = False) -> dict:
     llm_budget = {"remaining": budget}
     groups = group_by_license(entries, llm_budget)
 
-    dep5_text = build_dep5(groups, source_name)
+    dep5_text = build_dep5(groups, source_name, source_dir)
 
     written_to = None
     backed_up  = None
