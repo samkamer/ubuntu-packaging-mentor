@@ -317,7 +317,43 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
             " #include <stdlib.h>\n"
         )
 
-    # ── builder internals ─────────────────────────────────────────────────────
+    # ── guardian internals ────────────────────────────────────────────────────
+    if "ubuntu security hardening expert" in sp:
+        if "exposed secrets" in up or "private_key" in up or "hardcoded_password" in up:
+            return (
+                "CRITICAL — Exposed Private Key / Credentials:\n"
+                "A private key or credential in source code is immediately exploitable. "
+                "Anyone with repository access can impersonate the key owner or access "
+                "protected resources. Treat it as already compromised: rotate the key NOW, "
+                "then remove it from the repository AND rewrite git history (git filter-repo) "
+                "because the key remains visible in prior commits even after deletion.\n\n"
+                "HIGH — Hardcoded Password:\n"
+                "Hardcoded passwords are visible in compiled binaries (strings(1)) and "
+                "source archives. They cannot be rotated without a source change. "
+                "Use environment variables or a secrets manager instead.\n\n"
+                "Remediation: DEB_BUILD_MAINT_OPTIONS = hardening=+all in debian/rules."
+            )
+        if "missing compiler hardening" in up or "stackprotector" in up or "relro" in up:
+            return (
+                "Missing Compiler Hardening Flags:\n\n"
+                "-fstack-protector-strong: Inserts canary values before the return address "
+                "on the stack. If a buffer overflow overwrites the canary, the program "
+                "aborts instead of executing attacker-controlled code. Without it, stack "
+                "smashing attacks succeed silently.\n\n"
+                "-D_FORTIFY_SOURCE=2: Replaces unsafe libc calls (strcpy, sprintf, etc.) "
+                "with bounds-checked versions. Detects buffer overflows at runtime and "
+                "catches some at compile time. Zero-cost on safe code paths.\n\n"
+                "-Wl,-z,relro + -Wl,-z,now (full RELRO): Makes the GOT/PLT read-only after "
+                "dynamic linking completes. Prevents GOT-overwrite attacks used in "
+                "return-oriented programming (ROP) chains.\n\n"
+                "-fPIE/-pie: Position-Independent Executable enables ASLR at the "
+                "executable level, randomising load address and making memory-corruption "
+                "exploits harder to target.\n\n"
+                "Fix: add 'DEB_BUILD_MAINT_OPTIONS = hardening=+all' to debian/rules."
+            )
+        return "No security issues found — all checks passed."
+
+
     if "last 20 lines of the debuild output" in up:
         if "cannot find" in up or "no such file" in up or "unmet build" in up:
             return (
