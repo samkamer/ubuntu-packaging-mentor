@@ -1,0 +1,7 @@
+#!/usr/bin/make -f
+# Canary debian/rules — intentionally missing DEB_BUILD_MAINT_OPTIONS hardening
+# so that blhc will report missing compiler security flags.
+# This is part of the guardian validation canary package.
+
+%:
+	dh $@
