@@ -275,15 +275,70 @@ Requires `lintian`: `sudo apt install lintian`
 ## Quick start
 
 ```bash
-# Default: Ollama/Gemma3 on local network
+# First run — detects your environment and writes config
 python3 mentor.py
 
-# Demo mode (no LLM required)
+# Or explicitly re-run setup any time (re-detect tools and LLM)
+python3 mentor.py --setup
+
+# Demo mode (no LLM required, skips config)
 AI_PROVIDER=demo python3 mentor.py
 
 # Increase LLM budget for large packages
 LLM_BUDGET=600 python3 mentor.py
 ```
+
+If installed from the `.deb` package, `postinst` will remind you to run `ubu-dev-mentor --setup` after the first install.
+
+---
+
+## Setup & Configuration
+
+On first launch (or when `--setup` is passed), `ubu-dev-mentor` runs an automated environment detection and writes a persistent config file.
+
+### What gets detected
+
+| Item | How |
+|------|-----|
+| **Packaging tools** | `shutil.which` for each required binary |
+| **Ollama endpoint** | HTTP probe: `localhost` → `127.0.0.1` → host gateway IP |
+| **Active model** | Reads `/api/tags`; prefers `gemma3`, else first available model |
+
+Missing tools are flagged with the `apt install` command needed to add them. Found tools and the detected LLM endpoint are written to config as good defaults.
+
+### Config file
+
+Location: `$XDG_CONFIG_HOME/ubu-dev-mentor/config` (default: `~/.config/ubu-dev-mentor/config`)
+
+```ini
+[llm]
+provider = ollama
+url      = http://192.168.1.1:11434
+model    = gemma3:latest
+budget   = 180
+
+[tools]
+licensecheck = /usr/bin/licensecheck
+apt_file     = /usr/bin/apt-file
+debuild      = /usr/bin/debuild
+quilt        = /usr/bin/quilt
+lintian      = /usr/bin/lintian
+patch        = /usr/bin/patch
+```
+
+Only tools that are actually found on the system are written. Edit the file freely — `--setup` merges new detections rather than blindly overwriting your changes.
+
+### Supported LLM providers
+
+| `provider` value | Description |
+|-----------------|-------------|
+| `ollama` | Local Ollama instance (default) |
+| `copilot` | GitHub Copilot API (set `AI_PROVIDER=copilot`) |
+| `demo` | Canned responses — no LLM required, great for testing |
+
+Environment variables (`AI_PROVIDER`, `LLM_URL`, `LLM_MODEL`, `LLM_BUDGET`) override config file values when set.
+
+---
 
 ## Re-record demos
 
