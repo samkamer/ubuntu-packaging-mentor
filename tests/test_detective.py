@@ -17,9 +17,11 @@ from agents.detective import (
     _python_dedup,
     _detect_competing_groups,
     _collect_own_headers,
+    _build_libc_header_skip,
     PipelineLog,
     scan_build_system,
     scan_autoconf_deps,
+    scan_c_headers,
 )
 
 
@@ -432,3 +434,123 @@ class TestPlatformSkipNewHeaders:
     def test_brotli_not_skipped(self):
         assert not _PLATFORM_SKIP.match("brotli/decode.h")
 
+
+class TestBuildLibcHeaderSkip:
+    """Tests for _build_libc_header_skip() — dynamic build-essential header set."""
+
+    def test_returns_frozenset(self):
+        result = _build_libc_header_skip()
+        assert isinstance(result, frozenset)
+
+    def test_mocked_direct_path(self, monkeypatch):
+        """Direct /usr/include/<header> paths are stored as-is."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = "/usr/include/stdio.h\n/usr/include/malloc.h\n/usr/share/doc/libc6-dev/README\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert "stdio.h" in result
+        assert "malloc.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_mocked_multiarch_path_normalised(self, monkeypatch):
+        """Multiarch paths like /usr/include/x86_64-linux-gnu/sys/stat.h → sys/stat.h."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = (
+            "/usr/include/x86_64-linux-gnu/sys/stat.h\n"
+            "/usr/include/x86_64-linux-gnu/sys/types.h\n"
+            "/usr/include/x86_64-linux-gnu/sys/auxv.h\n"
+        )
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert "sys/stat.h" in result
+        assert "sys/types.h" in result
+        assert "sys/auxv.h" in result
+        # Raw multiarch form must NOT be stored
+        assert "x86_64-linux-gnu/sys/stat.h" not in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_non_include_paths_ignored(self, monkeypatch):
+        """Lines outside /usr/include/ are not added."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = "/usr/lib/libc.a\n/usr/share/man/man3/malloc.3.gz\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert len(result) == 0
+        _build_libc_header_skip.cache_clear()
+
+    def test_dpkg_missing_returns_empty(self, monkeypatch):
+        """If dpkg is not found, return empty set (graceful fallback)."""
+        _build_libc_header_skip.cache_clear()
+        import subprocess as sp
+        def raise_fnf(*a, **kw):
+            raise FileNotFoundError("dpkg not found")
+        monkeypatch.setattr("subprocess.run", raise_fnf)
+        result = _build_libc_header_skip()
+        assert result == frozenset()
+        _build_libc_header_skip.cache_clear()
+
+    def test_dpkg_failure_returns_empty(self, monkeypatch):
+        """If dpkg exits non-zero, that package is skipped gracefully."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
+        result = _build_libc_header_skip()
+        assert result == frozenset()
+        _build_libc_header_skip.cache_clear()
+
+    @pytest.mark.skipif(
+        not __import__("shutil").which("dpkg"), reason="dpkg not available"
+    )
+    def test_real_glibc_headers_present(self):
+        """Live integration: real libc6-dev headers are in the skip set."""
+        _build_libc_header_skip.cache_clear()
+        result = _build_libc_header_skip()
+        # These are always in libc6-dev (multiarch-normalised)
+        assert "sys/stat.h" in result
+        assert "sys/types.h" in result
+        assert "malloc.h" in result
+
+    @pytest.mark.skipif(
+        not __import__("shutil").which("dpkg"), reason="dpkg not available"
+    )
+    def test_systemtap_sdt_not_in_libc_skip(self):
+        """sys/sdt.h is from systemtap-sdt-dev (not build-essential) — must NOT be skipped."""
+        _build_libc_header_skip.cache_clear()
+        result = _build_libc_header_skip()
+        assert "sys/sdt.h" not in result
+
+
+class TestScanCHeadersLibcFilter:
+    """Tests that scan_c_headers respects the libc/build-essential skip set."""
+
+    def test_libc_header_filtered_out(self, monkeypatch, tmp_path):
+        """A header in the libc skip set should not appear in scan output."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset({"sys/stat.h"}))
+        src = tmp_path / "foo.c"
+        src.write_text('#include <sys/stat.h>\n#include <zlib.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "sys/stat.h" not in result
+        assert "zlib.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_non_libc_header_kept(self, monkeypatch, tmp_path):
+        """A header NOT in the libc skip set should still be returned."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset({"sys/stat.h"}))
+        src = tmp_path / "bar.c"
+        src.write_text('#include <openssl/ssl.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "openssl/ssl.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_anchored_regex_ignores_inline_comment(self, monkeypatch, tmp_path):
+        """Regex is anchored: #include inside a comment should not be picked up."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset())
+        src = tmp_path / "baz.c"
+        # A comment containing the word #include must not match
+        src.write_text('/* see also #include <fake.h> */\n#include <real.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "fake.h" not in result
+        assert "real.h" in result
+        _build_libc_header_skip.cache_clear()

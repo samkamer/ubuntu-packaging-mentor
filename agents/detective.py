@@ -18,6 +18,7 @@ Returns JSON:
 """
 
 import ast
+import functools
 import json
 import os
 import re
@@ -65,7 +66,10 @@ _PLATFORM_SKIP = re.compile(r"""
       # AmigaOS / BeOS
       proto/ | bsdsocket | amitcp |
       # OS/2 / DOS / RISCOS
-      os2\.h | dos\.h | unixlib |
+      os2\.h | dos\.h | unixlib | alloc\.h |
+      # CPU-architecture-specific intrinsics — provided by gcc on the native arch,
+      # never a -dev package Build-Depends on a cross-arch Ubuntu build
+      altivec\.h | vecintrin\.h | mmintrin\.h | immintrin\.h | arm_neon\.h |
       # Generic C runtime headers we can ignore (always available via libc-dev)
       assert\.h | ctype\.h | errno\.h | float\.h | limits\.h | locale\.h |
       math\.h | setjmp\.h | signal\.h | stdarg\.h | stddef\.h | stdio\.h |
@@ -252,7 +256,10 @@ def scan_c_headers(source_dir: str) -> set[str]:
     Skips platform-specific headers and non-Linux directories.
     """
     headers = set()
-    pattern = re.compile(r'#\s*include\s+<([^>]+)>')
+    # Anchored to line start: avoids matching #include inside comments or
+    # patch diff context lines that happen to mention an include.
+    pattern = re.compile(r'^\s*#\s*include\s+<([^>]+)>')
+    libc_skip = _build_libc_header_skip()
     for root, dirs, files in os.walk(source_dir):
         # Prune skip dirs in-place so os.walk doesn't descend into them
         dirs[:] = [d for d in dirs if not _should_skip_dir(d)]
@@ -264,10 +271,11 @@ def scan_c_headers(source_dir: str) -> set[str]:
                         for i, line in enumerate(fh):
                             if i > 200:
                                 break
-                            m = pattern.search(line)
+                            m = pattern.match(line)
                             if m:
                                 header = m.group(1)
-                                if not _PLATFORM_SKIP.match(header):
+                                if (not _PLATFORM_SKIP.match(header)
+                                        and header not in libc_skip):
                                     headers.add(header)
                 except OSError:
                     pass
@@ -361,6 +369,48 @@ def _apt_file_search_with_paths(query: str) -> list[tuple[str, str]]:
 # ── Canonical include path ranking ───────────────────────────────────────────
 
 _ARCH_TRIPLET_RE = re.compile(r'^[a-z0-9_]+-linux-[a-z0-9_-]+$')
+
+
+@functools.lru_cache(maxsize=None)
+def _build_libc_header_skip() -> frozenset[str]:
+    """Return the set of C header paths always available without an explicit
+    Build-Depends entry, per Debian Policy §4.2.
+
+    ``libc6-dev`` and ``linux-libc-dev`` are part of build-essential and are
+    installed in every clean build environment (sbuild, pbuilder) without
+    needing to be listed in Build-Depends.  Any header they provide should
+    never drive a Build-Depends detection.
+
+    Multiarch install paths (``/usr/include/x86_64-linux-gnu/sys/stat.h``)
+    are normalised to their canonical form (``sys/stat.h``) by stripping the
+    arch-triplet directory segment so they match the bare header names that
+    ``scan_c_headers`` extracts from source files.
+
+    Results are cached after the first call.  Falls back to an empty set
+    gracefully if ``dpkg`` is unavailable (e.g. in CI without build-essential).
+    """
+    skip: set[str] = set()
+    prefix = "/usr/include/"
+    for pkg in ("libc6-dev", "linux-libc-dev"):
+        try:
+            result = subprocess.run(
+                ["dpkg", "-L", pkg],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            if not line.startswith(prefix) or not line.endswith(".h"):
+                continue
+            rel = line[len(prefix):]
+            # Normalise multiarch: x86_64-linux-gnu/sys/stat.h → sys/stat.h
+            parts = rel.split("/", 1)
+            if len(parts) == 2 and _ARCH_TRIPLET_RE.match(parts[0]):
+                rel = parts[1]
+            skip.add(rel)
+    return frozenset(skip)
 
 
 def _rank_header_candidates(
