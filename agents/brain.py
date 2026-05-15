@@ -5,7 +5,7 @@ agents/brain.py — Provider-based LLM utility
 Selects the AI backend from the AI_PROVIDER environment variable.
 
   AI_PROVIDER=ollama   (default) — local Gemma via Ollama on the host gateway
-  AI_PROVIDER=copilot            — GitHub Copilot via `gh copilot explain`
+  AI_PROVIDER=copilot            — GitHub Copilot via `copilot -p` (Copilot CLI)
 
 Public API:
     ask(system_prompt, user_prompt, label="Thinking", timeout=600) -> str
@@ -22,29 +22,18 @@ import urllib.error
 
 import requests
 
+from agents.network import get_host_ip
+
 # ── Provider config ───────────────────────────────────────────────────────────
 
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "ollama").lower()
 
 # ── Ollama config (only resolved when provider is ollama) ─────────────────────
 
-def _get_host_ip() -> str:
-    """Detect the host gateway IP from the routing table."""
-    result = subprocess.run(
-        ["ip", "route", "show", "default"],
-        capture_output=True, text=True,
-    )
-    parts = result.stdout.split()
-    try:
-        return parts[parts.index("via") + 1]
-    except (ValueError, IndexError):
-        raise RuntimeError(f"Could not detect default gateway: {result.stdout!r}")
-
-
 if AI_PROVIDER == "ollama":
-    HOST_IP   = _get_host_ip()
-    OLLAMA_URL = f"http://{HOST_IP}:11434/api/generate"
-    MODEL      = "gemma3:latest"
+    HOST_IP    = get_host_ip()
+    OLLAMA_URL = os.environ.get("LLM_URL", f"http://{HOST_IP}:11434") + "/api/generate"
+    MODEL      = os.environ.get("LLM_MODEL", "gemma3:latest")
 else:
     HOST_IP    = None
     OLLAMA_URL = None
@@ -373,29 +362,26 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
 
 
 def _ask_copilot(system_prompt: str, user_prompt: str, timeout: int) -> str:
-    """Call `gh copilot explain` and return the stripped response text."""
+    """Call `copilot -p` (Copilot CLI non-interactive mode) and return the response."""
     combined = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
     try:
         result = subprocess.run(
-            ["gh", "copilot", "explain", combined],
+            ["copilot", "-p", combined, "-s", "--available-tools="],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
     except FileNotFoundError:
-        raise RuntimeError("'gh' CLI not found. Install it from https://cli.github.com/")
+        raise RuntimeError("'copilot' CLI not found. Make sure the GitHub Copilot CLI is installed.")
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"gh copilot explain timed out after {timeout}s")
+        raise RuntimeError(f"copilot -p timed out after {timeout}s")
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"gh copilot explain failed (exit {result.returncode}): {result.stderr.strip()}"
+            f"copilot -p failed (exit {result.returncode}): {result.stderr.strip()}"
         )
 
-    output = result.stdout.strip()
-    # Strip leading "Explanation:" header if present
-    output = re.sub(r"^Explanation:\s*", "", output, flags=re.IGNORECASE).strip()
-    return output
+    return result.stdout.strip()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
