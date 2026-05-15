@@ -1,6 +1,7 @@
 # tests/test_detective.py — unit tests for agents/detective.py
 import os
 import sys
+import tempfile
 import textwrap
 
 import pytest
@@ -14,6 +15,9 @@ from agents.detective import (
     _rank_header_candidates,
     _is_blocked_package,
     _python_dedup,
+    _detect_competing_groups,
+    _collect_own_headers,
+    PipelineLog,
     scan_build_system,
     scan_autoconf_deps,
 )
@@ -272,4 +276,159 @@ class TestPythonDedup:
 
     def test_empty_input(self):
         assert _python_dedup([]) == []
+
+
+class TestPipelineLogIntegration:
+    """_python_dedup records corrections and blocklisted packages in PipelineLog."""
+
+    def test_logs_name_correction(self):
+        log = PipelineLog()
+        result = _python_dedup(["lib32z1-dev", "libssl-dev"], log=log)
+        assert result == ["libssl-dev", "zlib1g-dev"]
+        assert log.name_corrections == [{"from": "lib32z1-dev", "to": "zlib1g-dev"}]
+
+    def test_logs_blocklisted_exact(self):
+        log = PipelineLog()
+        _python_dedup(["libssl-dev", "libc6-dev"], log=log)
+        assert any(e["pkg"] == "libc6-dev" for e in log.blocklisted)
+
+    def test_logs_blocklisted_prefix(self):
+        log = PipelineLog()
+        _python_dedup(["libssl-dev", "android-liblog-dev"], log=log)
+        assert any(e["pkg"] == "android-liblog-dev" for e in log.blocklisted)
+
+    def test_logs_ldap_correction(self):
+        log = PipelineLog()
+        result = _python_dedup(["libldap-dev"], log=log)
+        assert result == ["libldap2-dev"]
+        assert log.name_corrections == [{"from": "libldap-dev", "to": "libldap2-dev"}]
+
+    def test_no_log_when_none(self):
+        # No crash when log is not provided
+        result = _python_dedup(["lib32z1-dev", "libc6-dev"])
+        assert "zlib1g-dev" in result
+        assert "libc6-dev" not in result
+
+    def test_libnewlib_blocklisted(self):
+        log = PipelineLog()
+        _python_dedup(["libnewlib-dev", "libssl-dev"], log=log)
+        assert any(e["pkg"] == "libnewlib-dev" for e in log.blocklisted)
+
+
+class TestDetectCompetingGroups:
+    """_detect_competing_groups flags multiple packages from the same header namespace."""
+
+    def test_single_package_per_namespace_not_flagged(self):
+        pkg_to_headers = {
+            "libssl-dev":    ["openssl/ssl.h", "openssl/crypto.h"],
+            "libnghttp2-dev": ["nghttp2/nghttp2.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert groups == []
+
+    def test_two_packages_same_namespace_flagged(self):
+        pkg_to_headers = {
+            "libngtcp2-dev":             ["ngtcp2/ngtcp2.h"],
+            "libngtcp2-crypto-gnutls-dev": ["ngtcp2/ngtcp2_crypto_gnutls.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert groups[0]["namespace"] == "ngtcp2"
+        assert set(groups[0]["packages"]) == {
+            "libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"
+        }
+
+    def test_three_packages_same_namespace(self):
+        pkg_to_headers = {
+            "pkg-a": ["crypto/a.h"],
+            "pkg-b": ["crypto/b.h"],
+            "pkg-c": ["crypto/c.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert len(groups[0]["packages"]) == 3
+
+    def test_flat_headers_no_namespace_ignored(self):
+        # Headers like 'libssl.h' (no dir prefix) don't contribute to namespace grouping
+        pkg_to_headers = {
+            "libssl-dev":  ["libssl.h"],
+            "libcurl-dev": ["libcurl.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert groups == []
+
+    def test_mixed_flat_and_namespaced(self):
+        pkg_to_headers = {
+            "libssl-dev":    ["libssl.h", "openssl/ssl.h"],
+            "libgnutls-dev": ["openssl/compat.h"],  # edge: same namespace, competing
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert groups[0]["namespace"] == "openssl"
+
+    def test_empty_input(self):
+        assert _detect_competing_groups({}) == []
+
+    def test_reason_string_present(self):
+        pkg_to_headers = {
+            "pkg-a": ["tls/a.h"],
+            "pkg-b": ["tls/b.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert "tls/" in groups[0]["reason"]
+        assert "competing" in groups[0]["reason"].lower()
+
+
+class TestCollectOwnHeaders:
+    """_collect_own_headers returns headers under <source_dir>/include/ only."""
+
+    def test_finds_headers_in_include_dir(self, tmp_path):
+        include = tmp_path / "include" / "mylib"
+        include.mkdir(parents=True)
+        (include / "mylib.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "mylib/mylib.h" in own
+
+    def test_top_level_header_in_include(self, tmp_path):
+        include = tmp_path / "include"
+        include.mkdir()
+        (include / "toplevel.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "toplevel.h" in own
+
+    def test_no_include_dir_returns_empty(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "main.c").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert len(own) == 0
+
+    def test_vendored_subdir_include_not_collected(self, tmp_path):
+        # Headers inside vendor/ subdirs must NOT be collected — they still
+        # need apt-file resolution.
+        vendor_include = tmp_path / "vendor" / "openssl" / "include" / "openssl"
+        vendor_include.mkdir(parents=True)
+        (vendor_include / "ssl.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "openssl/ssl.h" not in own
+
+    def test_returns_frozenset(self, tmp_path):
+        own = _collect_own_headers(str(tmp_path))
+        assert isinstance(own, frozenset)
+
+
+class TestPlatformSkipNewHeaders:
+    """iconv.h and netdb.h are now in _PLATFORM_SKIP."""
+
+    def test_iconv_is_skipped(self):
+        assert _PLATFORM_SKIP.match("iconv.h")
+
+    def test_netdb_is_skipped(self):
+        assert _PLATFORM_SKIP.match("netdb.h")
+
+    def test_libssl_not_skipped(self):
+        assert not _PLATFORM_SKIP.match("openssl/ssl.h")
+
+    def test_brotli_not_skipped(self):
+        assert not _PLATFORM_SKIP.match("brotli/decode.h")
 

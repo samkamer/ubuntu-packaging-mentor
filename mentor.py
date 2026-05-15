@@ -262,6 +262,80 @@ def _show_write_status(result: dict) -> None:
         print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
 
 
+def _format_detective_warnings(warnings: dict, persona_name: str) -> str | None:
+    """
+    Format detective pipeline warnings for the contributor.
+
+    Returns a formatted string, or None if there are no warnings to show.
+    Persona determines verbosity:
+      Beginner  — plain English guidance on what to check and why
+      MOTU      — technical list with Debian Policy reference
+      CoreDev   — raw JSON diff of pipeline decisions
+    """
+    if not warnings:
+        return None
+
+    fn_list  = warnings.get("possible_false_negatives", [])
+    fp_list  = warnings.get("possible_false_positives", [])
+    corr     = warnings.get("name_corrections", [])
+    blocked  = warnings.get("blocklisted", [])
+
+    if not any([fn_list, fp_list, corr, blocked]):
+        return None
+
+    if persona_name == "CoreDev":
+        return c(YELLOW, "\n── Detective pipeline log ──────────────────────────\n") + \
+               json.dumps(warnings, indent=2) + \
+               "\n" + c(YELLOW, "────────────────────────────────────────────────────")
+
+    lines = [c(YELLOW, "\n── Build-Depends verification needed ───────────────")]
+
+    if persona_name == "MOTU":
+        lines.append(
+            c(YELLOW, "  Per Debian Policy §7.6, all direct build-time deps must be explicit.")
+        )
+        if fn_list:
+            lines.append(c(YELLOW, "\n  Possibly missing (removed during dedup — reinstate if directly used):"))
+            for item in fn_list:
+                lines.append(f"    {item['pkg']}")
+        if fp_list:
+            lines.append(c(YELLOW, "\n  Competing implementations detected (keep one matching your build profile):"))
+            for item in fp_list:
+                lines.append(f"    {item['pkg']}  ← {item['reason']}")
+        if corr:
+            lines.append(c(YELLOW, "\n  Automatic name corrections applied:"))
+            for item in corr:
+                lines.append(f"    {item['from']}  →  {item['to']}")
+        if blocked:
+            lines.append(c(YELLOW, "\n  Filtered (always available or platform-specific):"))
+            for item in blocked:
+                lines.append(f"    {item['pkg']}  ({item['reason']})")
+
+    else:  # Beginner
+        if fn_list:
+            lines.append(c(YELLOW, "\n  ⚠ These packages were found in your source but filtered out."))
+            lines.append(  "    Add them back if your package actually uses them:")
+            for item in fn_list:
+                lines.append(f"    • {item['pkg']}")
+        if fp_list:
+            lines.append(c(YELLOW, "\n  ⚠ These packages may not all be needed at the same time."))
+            lines.append(  "    Usually only one implementation of each library is required.")
+            lines.append(  "    Delete the ones you are not using:")
+            for item in fp_list:
+                lines.append(f"    • {item['pkg']}")
+        if corr:
+            lines.append(c(YELLOW, "\n  ✓ These package names were auto-corrected to Ubuntu naming:"))
+            for item in corr:
+                lines.append(f"    • {item['from']}  →  {item['to']}")
+        if blocked:
+            lines.append(c(YELLOW, "\n  ✓ These were removed (already in every Ubuntu build environment):"))
+            for item in blocked:
+                lines.append(f"    • {item['pkg']}")
+
+    lines.append(c(YELLOW, "────────────────────────────────────────────────────"))
+    return "\n".join(lines)
+
+
 def _persona_explain(touchpoint: str, skill_name: str, persona: dict,
                      extra: str = "", label: str = "Thinking") -> None:
     """
@@ -379,6 +453,10 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                 print(c(CYAN, f"  {_COREDEV_SUMMARY['Detect'](result)}"))
         else:
             print(c(YELLOW, "\nNo external dependencies detected."))
+        warnings = result.get("data", {}).get("warnings", {})
+        warn_str = _format_detective_warnings(warnings, persona["name"])
+        if warn_str:
+            print(warn_str)
 
     elif sname == "Scribe" and result.get("data"):
         print(c(CYAN, "\n── Generated debian/changelog entry ────────────────"))
