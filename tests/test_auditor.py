@@ -22,8 +22,28 @@ class TestIsValidDep5:
     def test_combined_with_and(self):
         assert _is_valid_dep5("GPL-2+ AND LGPL-2.1+")
 
+    def test_combined_with_or(self):
+        assert _is_valid_dep5("curl or ISC")
+        assert _is_valid_dep5("FSFUL or curl")
+
+    def test_with_exception_clause(self):
+        assert _is_valid_dep5("GPL-2+ with Autoconf-data exception")
+        assert _is_valid_dep5("GPL-3+ with Autoconf-data exception")
+        assert _is_valid_dep5("GPL-2+ with Libtool exception")
+
+    def test_project_specific_identifier(self):
+        assert _is_valid_dep5("curl")
+        assert _is_valid_dep5("OLDAP-2.8")
+        assert _is_valid_dep5("BSD-4-Clause-UC")
+
+    def test_or_later_not_split(self):
+        # 'or later' is part of a version string, not an alternative license
+        assert _is_valid_dep5("GPL-2+")   # normalised form of 'GPL-2 or later'
+
     def test_unknown_returns_false(self):
-        assert not _is_valid_dep5("SomeMadeUpLicense-9")
+        # Properly formatted identifiers are accepted (project-specific names are valid DEP-5)
+        # Only reject things that look like prose / sentences
+        assert not _is_valid_dep5("This is the MIT License, use it freely")
 
     def test_empty_string_invalid(self):
         assert not _is_valid_dep5("")
@@ -46,6 +66,19 @@ class TestRegexFallback:
         ("GNU Lesser General Public License v2.1 or later", "LGPL-2.1+"),
         ("GNU Lesser General Public License v3",    "LGPL-3"),
         ("MPL 2.0",                                  "MPL-2.0"),
+        # Exception-aware patterns
+        ("GNU General Public License v2.0 or later (Autoconf-data exception)",
+                                                     "GPL-2+ with Autoconf-data exception"),
+        ("GNU General Public License v2 with Autoconf-data exception",
+                                                     "GPL-2+ with Autoconf-data exception"),
+        ("GNU General Public License v2.0 or later (Libtool exception)",
+                                                     "GPL-2+ with Libtool exception"),
+        ("GNU General Public License v3.0 or later (Autoconf data exception)",
+                                                     "GPL-3+ with Autoconf-data exception"),
+        # Project-specific and SPDX extras
+        ("curl License",                             "curl"),
+        ("OpenLDAP Public License 2.8",              "OLDAP-2.8"),
+        ("BSD 4-Clause University of California",    "BSD-4-Clause-UC"),
     ])
     def test_known_mapping(self, raw, expected):
         assert _regex_fallback(raw) == expected
@@ -55,8 +88,13 @@ class TestRegexFallback:
         assert result == "MIT"
 
     def test_and_joining(self):
+        # 'and/or' in license context means either may be chosen → DEP-5 'or'
         result = _regex_fallback("MIT and/or Apache License 2.0")
-        assert result == "MIT AND Apache-2.0"
+        assert result == "MIT or Apache-2.0"
+
+    def test_or_dual_license(self):
+        result = _regex_fallback("ISC License or curl License")
+        assert result == "ISC or curl"
 
     def test_truly_unknown_returns_cleaned_string(self):
         result = _regex_fallback("Some Exotic License 1.0")

@@ -35,24 +35,44 @@ from agents.brain import ask, llm_budget_seconds, backup_file
 
 VALID_DEP5_IDS = {
     "AFL-2.1", "AGPL-3", "AGPL-3+", "Apache-2.0", "Artistic", "Artistic-2.0",
-    "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "BSL-1.0", "CC0-1.0",
-    "CC-BY-4.0", "CC-BY-SA-4.0", "CDDL", "CPL-1.0", "EPL-1.0", "EPL-2.0",
+    "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "BSD-4-Clause-UC", "BSL-1.0",
+    "CC0-1.0", "CC-BY-4.0", "CC-BY-SA-4.0", "CDDL", "CPL-1.0", "EPL-1.0", "EPL-2.0",
     "EUPL-1.1", "Expat", "FSFAP", "FSFUL", "FSFULLR",
     "GFDL-1.1", "GFDL-1.1+", "GFDL-1.2", "GFDL-1.2+", "GFDL-1.3", "GFDL-1.3+",
     "GPL", "GPL-1", "GPL-1+", "GPL-2", "GPL-2+", "GPL-3", "GPL-3+",
     "ISC", "LGPL-2", "LGPL-2+", "LGPL-2.1", "LGPL-2.1+", "LGPL-3", "LGPL-3+",
     "LPPL-1.3c", "MIT", "MIT-0", "MPL-1.1", "MPL-2.0", "MS-PL", "MS-RL",
-    "public-domain", "Python-2.0", "Ruby", "Unlicense", "UNKNOWN",
+    "OLDAP-2.8", "public-domain", "Python-2.0", "Ruby", "Unlicense", "UNKNOWN",
     "W3C", "X11", "Zlib", "ZPL-2.0",
+    # Project-specific identifiers common in Ubuntu/Debian packaging
+    "curl",
 }
+
+# Regex matching a single valid DEP-5 identifier, including 'with <exception>' suffix
+# and short custom identifiers (e.g. 'curl', 'Artistic').
+_DEP5_ID_RE = re.compile(
+    r'^[A-Za-z][A-Za-z0-9.\-+]*'              # base identifier
+    r'(?:\s+with\s+[A-Za-z0-9][A-Za-z0-9 .\-]*)?$'  # optional exception clause
+)
 
 LLM_TIMEOUT_PER_CALL = 15    # seconds per individual license-normalization call
 LLM_BUDGET_SECONDS   = None  # resolved at call time from LLM_BUDGET env var
 
 
 def _is_valid_dep5(identifier: str) -> bool:
-    parts = [p.strip() for p in re.split(r"\s+AND\s+|\s+OR\s+", identifier)]
-    return all(p in VALID_DEP5_IDS for p in parts)
+    # Split on ' or ' (not 'or later') and ' AND '/'and'
+    parts = [p.strip() for p in re.split(r"\s+(?:AND|and|OR)\s+|\s+or\s+(?!later\b)", identifier)]
+    non_empty = [p for p in parts if p]
+    if not non_empty:
+        return False
+    for part in non_empty:
+        # Accept known identifiers, known identifiers with 'with <exception>',
+        # and any short custom identifier matching the DEP-5 format.
+        base = re.sub(r"\s+with\s+.+$", "", part).strip()
+        if base in VALID_DEP5_IDS or _DEP5_ID_RE.match(part):
+            continue
+        return False
+    return True
 
 
 # ── licensecheck ──────────────────────────────────────────────────────────────
@@ -108,13 +128,24 @@ def _regex_fallback(raw: str) -> str:
     """Map a raw license string to a DEP-5 identifier using regex only."""
     cleaned = re.sub(r"\s*\[generated file\]", "", raw, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"^\*No copyright\*\s*", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"\s+and/or\s+", " AND ", cleaned, flags=re.IGNORECASE)
+    # 'and/or' in license context means either license is acceptable → DEP-5 'or'
+    cleaned = re.sub(r"\s+and/or\s+", " or ", cleaned, flags=re.IGNORECASE)
 
-    if " AND " in cleaned:
-        return " AND ".join(_regex_fallback(p.strip()) for p in cleaned.split(" AND "))
+    # Split compound expressions on ' or ' (but NOT 'or later') and ' AND '
+    if re.search(r"\s+or\s+(?!later\b)|\s+AND\s+", cleaned):
+        parts = re.split(r"\s+or\s+(?!later\b)|\s+AND\s+", cleaned)
+        return " or ".join(_regex_fallback(p.strip()) for p in parts if p.strip())
 
     n = cleaned.lower()
     mappings = [
+        # Exception-aware patterns must precede plain GPL patterns (most specific first)
+        (r"gnu general public license v?2.*(?:autoconf|data).*exception",
+                                                   "GPL-2+ with Autoconf-data exception"),
+        (r"gnu general public license v?2.*libtool.*exception",
+                                                   "GPL-2+ with Libtool exception"),
+        (r"gnu general public license v?3.*(?:autoconf|data).*exception",
+                                                   "GPL-3+ with Autoconf-data exception"),
+        # Plain GPL/LGPL/GFDL
         (r"gnu general public license v?3.*or later",           "GPL-3+"),
         (r"gnu general public license v?3",                     "GPL-3"),
         (r"gnu general public license v?2.*or later",           "GPL-2+"),
@@ -130,15 +161,21 @@ def _regex_fallback(raw: str) -> str:
         (r"gnu free documentation license v?1\.3",              "GFDL-1.3"),
         (r"gnu free documentation license v?1\.2.*or later",    "GFDL-1.2+"),
         (r"gnu free documentation license v?1\.2",              "GFDL-1.2"),
+        # FSF licenses
         (r"fsf unlimited license.*retention",                   "FSFULLR"),
         (r"fsf unlimited license",                              "FSFUL"),
         (r"fsf all permissive",                                 "FSFAP"),
+        # Others
         (r"apache.*2",                                          "Apache-2.0"),
         (r"mit",                                                "MIT"),
         (r"x11",                                                "X11"),
         (r"isc",                                                "ISC"),
         (r"bsd.?2.?clause|simplified bsd",                      "BSD-2-Clause"),
         (r"bsd.?3.?clause|new bsd",                             "BSD-3-Clause"),
+        (r"bsd.?4.?clause.*california|university.*california",  "BSD-4-Clause-UC"),
+        (r"bsd.?4.?clause",                                     "BSD-4-Clause"),
+        (r"open\s*ldap.*2\.8",                                  "OLDAP-2.8"),
+        (r"^curl\s*licen|^the curl licen",                      "curl"),
         (r"mpl.*2",                                             "MPL-2.0"),
         (r"public.?domain",                                     "public-domain"),
         (r"unknown",                                            "UNKNOWN"),
@@ -154,10 +191,16 @@ def _call_llm(raw: str) -> str:
     system = "You are a Debian packaging expert."
     user = (
         "Map the following raw license string to a valid DEP-5 machine-readable "
-        "license identifier (e.g. GPL-2+, MIT, Apache-2.0).\n"
+        "license identifier (e.g. GPL-2+, MIT, Apache-2.0, curl, OLDAP-2.8).\n"
         "Rules:\n"
         "- Reply with ONLY the short DEP-5 identifier, nothing else.\n"
-        "- If multiple licenses, join with ' AND ' (e.g. GPL-2+ AND LGPL-2.1+).\n"
+        "- For alternative licenses (either may be chosen), join with ' or ' "
+        "(e.g. 'GPL-2+ or Artistic', 'curl or ISC').\n"
+        "- Use 'and' ONLY when both licenses apply simultaneously.\n"
+        "- Preserve exception clauses exactly — never shorten them "
+        "(e.g. 'GPL-2+ with Autoconf-data exception', NOT 'GPL-2+').\n"
+        "- For project-specific licenses (e.g. the curl license), use the "
+        "short project name as the identifier (e.g. 'curl').\n"
         "- If truly unknown, reply: UNKNOWN\n\n"
         f"Raw license string: {raw}\n"
         "DEP-5 identifier:"
