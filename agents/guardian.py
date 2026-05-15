@@ -34,6 +34,7 @@ Returns JSON:
         "secrets_found":     int,
         "missing_flags":     [str],         # flag category names blhc reported
         "hardening_status":  "clean" | "findings" | "unknown" | "skipped",
+        "hardening_reason":  str,           # reason code for status
         "remediation_code":  str,           # deterministic debian/rules fix
         "llm_explanation":   str,           # LLM educational explanation
         "build_log_checked": bool,
@@ -52,9 +53,10 @@ Secret scanning notes:
     - NO secret content is emitted in findings — only file, line, and type.
 
 Hardening note:
-    If blhc is not installed the hardening_status is "unknown" (non-authoritative
-    heuristic scanning is intentionally avoided — blhc IS the authoritative tool
-    for Debian Policy §10.1 compliance).
+    hardening_status may be "unknown" when blhc is unavailable, times out, or
+    returns output that cannot be mapped to known hardening categories.
+    Non-authoritative heuristic scanning is intentionally avoided — blhc IS the
+    authoritative tool for Debian Policy §10.1 compliance.
 """
 
 import json
@@ -468,31 +470,47 @@ def audit(source_dir: str, build_log: str | None = None) -> dict:
     # ── Phase 2: Hardening audit ─────────────────────────────────────────────
     missing_flags: list[str] = []
     hardening_status = "skipped"
+    hardening_reason = "skipped_no_build_log"
     build_log_checked = False
 
     if build_log:
         if not os.path.isfile(build_log):
+            hardening_reason = "build_log_not_found"
             print(
                 f"  [~] Build log not found: {build_log} — skipping hardening audit",
                 file=sys.stderr,
             )
         else:
             print("  [*] Running hardening audit (blhc) ...", file=sys.stderr)
-            missing_flags, hardening_status, _ = run_blhc(build_log)
+            missing_flags, hardening_status, raw_blhc = run_blhc(build_log)
             build_log_checked = True
 
             if hardening_status == "unknown":
+                blhc_path = shutil.which("blhc")
+                if blhc_path is None:
+                    hardening_reason = "blhc_not_installed"
+                elif "timed out" in raw_blhc.lower():
+                    hardening_reason = "blhc_timeout"
+                else:
+                    hardening_reason = "blhc_unrecognized_output"
                 print(
-                    "  [~] blhc not installed — hardening status unknown\n"
-                    "      Install with: sudo apt install blhc",
+                    "  [~] Hardening status unknown "
+                    "(blhc unavailable, timed out, or output unrecognized)",
                     file=sys.stderr,
                 )
+                if hardening_reason == "blhc_not_installed":
+                    print(
+                        "      Install with: sudo apt install blhc",
+                        file=sys.stderr,
+                    )
             elif hardening_status == "findings":
+                hardening_reason = "blhc_missing_flags"
                 print(
                     f"  [!] Missing hardening: {', '.join(missing_flags)}",
                     file=sys.stderr,
                 )
             else:
+                hardening_reason = "blhc_clean"
                 print("  [✓] All hardening flags present", file=sys.stderr)
 
     # ── Phase 3: Merge vulnerabilities ──────────────────────────────────────
@@ -525,6 +543,7 @@ def audit(source_dir: str, build_log: str | None = None) -> dict:
         "secrets_found":     secret_count,
         "missing_flags":     missing_flags,
         "hardening_status":  hardening_status,
+        "hardening_reason":  hardening_reason,
         "remediation_code":  remediation,
         "llm_explanation":   explanation,
         "build_log_checked": build_log_checked,

@@ -358,6 +358,7 @@ class TestAudit:
                 result = audit(str(tmp_path), str(log))
         assert result["build_log_checked"] is True
         assert result["hardening_status"] == "unknown"
+        assert result["hardening_reason"] == "blhc_not_installed"
         assert result["missing_flags"] == []
 
     def test_vulnerabilities_list_has_no_secret_values(self, tmp_path):
@@ -377,7 +378,7 @@ class TestAudit:
         required = {
             "status", "agent", "security_score", "verdict",
             "vulnerabilities", "secrets_found", "missing_flags",
-            "hardening_status", "remediation_code", "llm_explanation",
+            "hardening_status", "hardening_reason", "remediation_code", "llm_explanation",
             "build_log_checked",
         }
         assert required <= set(result.keys())

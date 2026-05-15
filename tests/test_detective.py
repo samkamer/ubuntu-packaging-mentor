@@ -3,6 +3,8 @@ import os
 import sys
 import tempfile
 import textwrap
+import subprocess
+import shutil
 
 import pytest
 
@@ -22,7 +24,22 @@ from agents.detective import (
     scan_build_system,
     scan_autoconf_deps,
     scan_c_headers,
+    detect,
 )
+
+
+def _has_installed_libc6_dev() -> bool:
+    if not shutil.which("dpkg-query"):
+        return False
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", "libc6-dev"],
+        capture_output=True,
+        text=True,
+    )
+    return (
+        result.returncode == 0
+        and "install ok installed" in result.stdout.lower()
+    )
 
 
 class TestIsStdlib:
@@ -381,6 +398,38 @@ class TestDetectCompetingGroups:
         assert "competing" in groups[0]["reason"].lower()
 
 
+class TestDetectWarningFiltering:
+    def test_competing_warning_only_uses_packages_kept_in_final_deps(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agents.detective.shutil.which", lambda cmd: "/usr/bin/apt-file")
+        monkeypatch.setattr("agents.detective.scan_c_headers", lambda _: {"ngtcp2/ngtcp2.h"})
+        monkeypatch.setattr("agents.detective.scan_python_imports", lambda _: set())
+        monkeypatch.setattr("agents.detective.scan_go_modules", lambda _: set())
+        monkeypatch.setattr("agents.detective.scan_build_system", lambda _: [])
+        monkeypatch.setattr(
+            "agents.detective.resolve_c_headers",
+            lambda *_: {"ngtcp2/ngtcp2.h": ["libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"]},
+        )
+        monkeypatch.setattr("agents.detective.resolve_python_modules", lambda _: {})
+        monkeypatch.setattr("agents.detective.scan_autoconf_deps", lambda _: {})
+        monkeypatch.setattr(
+            "agents.detective.resolve_with_llm",
+            lambda *_: (
+                ["libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"],
+                {
+                    "libngtcp2-dev": ["ngtcp2/ngtcp2.h"],
+                    "libngtcp2-crypto-gnutls-dev": ["ngtcp2/ngtcp2_crypto_gnutls.h"],
+                },
+            ),
+        )
+        monkeypatch.setattr("agents.detective.deduplicate_with_llm", lambda *_, **__: ["libngtcp2-dev"])
+
+        result = detect(str(tmp_path))
+
+        assert result["status"] == "success"
+        warnings = result["data"]["warnings"]
+        assert "possible_false_positives" not in warnings
+
+
 class TestCollectOwnHeaders:
     """_collect_own_headers returns headers under <source_dir>/include/ only."""
 
@@ -498,7 +547,8 @@ class TestBuildLibcHeaderSkip:
         _build_libc_header_skip.cache_clear()
 
     @pytest.mark.skipif(
-        not __import__("shutil").which("dpkg"), reason="dpkg not available"
+        not shutil.which("dpkg") or not _has_installed_libc6_dev(),
+        reason="dpkg/libc6-dev not available",
     )
     def test_real_glibc_headers_present(self):
         """Live integration: real libc6-dev headers are in the skip set."""
@@ -510,7 +560,8 @@ class TestBuildLibcHeaderSkip:
         assert "malloc.h" in result
 
     @pytest.mark.skipif(
-        not __import__("shutil").which("dpkg"), reason="dpkg not available"
+        not shutil.which("dpkg") or not _has_installed_libc6_dev(),
+        reason="dpkg/libc6-dev not available",
     )
     def test_systemtap_sdt_not_in_libc_skip(self):
         """sys/sdt.h is from systemtap-sdt-dev (not build-essential) — must NOT be skipped."""

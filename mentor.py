@@ -588,9 +588,11 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
             print(c(GREEN, "\n  No vulnerabilities found."))
 
         hstatus = result.get("hardening_status", "skipped")
+        hreason = result.get("hardening_reason")
         if hstatus == "unknown":
-            print(c(YELLOW, "\n  Hardening status: unknown (blhc not installed)"))
-            print(c(YELLOW, "  Install with: sudo apt install blhc"))
+            print(c(YELLOW, "\n  Hardening status: unknown (blhc unavailable, timed out, or output unrecognized)"))
+            if hreason == "blhc_not_installed":
+                print(c(YELLOW, "  Install with: sudo apt install blhc"))
         elif hstatus == "skipped":
             print(c(YELLOW, "\n  Hardening audit skipped (no build log provided)."))
 
