@@ -776,7 +776,7 @@ def deduplicate_with_llm(raw_deps: list[str],
 
     NOTE: The LLM must NOT remove packages on the grounds that they may be
     "pulled in transitively" — in Debian packaging, all direct build-time
-    dependencies must be listed explicitly in Build-Depends (Policy §7.6).
+    dependencies must be listed explicitly in Build-Depends (Policy §7.7).
 
     If *log* is provided, packages removed by the LLM step are recorded in
     log.dedup_removed as possible false negatives.
@@ -797,7 +797,7 @@ def deduplicate_with_llm(raw_deps: list[str],
         "  • Remove packages that are clearly not valid Ubuntu apt package names\n"
         "  • Remove doc-only packages (e.g. ending in -doc)\n"
         "  • Do NOT remove packages because they might be transitively provided — "
-        "Debian Policy §7.6 requires all direct build-time dependencies to be "
+        "Debian Policy §7.7 requires all direct build-time dependencies to be "
         "listed explicitly in Build-Depends even if another listed package depends "
         "on them at runtime\n"
         "  • Keep all legitimate -dev packages even if they seem redundant\n"

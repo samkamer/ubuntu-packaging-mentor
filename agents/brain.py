@@ -331,7 +331,8 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
                 "Hardcoded passwords are visible in compiled binaries (strings(1)) and "
                 "source archives. They cannot be rotated without a source change. "
                 "Use environment variables or a secrets manager instead.\n\n"
-                "Remediation: DEB_BUILD_MAINT_OPTIONS = hardening=+all in debian/rules."
+                "Remediation: export DEB_BUILD_MAINT_OPTIONS = hardening=+all in debian/rules "
+                "(the 'export' is required so dpkg-buildflags subprocesses inherit it)."
             )
         if "missing compiler hardening" in up or "stackprotector" in up or "relro" in up:
             return (
@@ -349,7 +350,9 @@ def _ask_demo(system_prompt: str, user_prompt: str, _timeout: int) -> str:
                 "-fPIE/-pie: Position-Independent Executable enables ASLR at the "
                 "executable level, randomising load address and making memory-corruption "
                 "exploits harder to target.\n\n"
-                "Fix: add 'DEB_BUILD_MAINT_OPTIONS = hardening=+all' to debian/rules."
+                "Fix: add 'export DEB_BUILD_MAINT_OPTIONS = hardening=+all' to debian/rules "
+                "(the 'export' is required so dpkg-buildflags and debhelper subprocesses "
+                "inherit the variable — without it the flags may not be applied)."
             )
         return "No security issues found — all checks passed."
 

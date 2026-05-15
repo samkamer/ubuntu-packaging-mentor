@@ -124,6 +124,7 @@ All tests must pass before opening a PR. The suite currently covers:
 | `test_config.py` | INI read/write, None omission, XDG path, corrupt file |
 | `test_preflight.py` | Tool detection, Ollama probing, run_setup output and config |
 | `test_mentor_warnings.py` | Per-persona detective warnings formatting |
+| `test_guardian.py` | Secret scanner patterns, blhc hardening audit, scoring algorithm, symlink safety, full audit pipeline |
 | `test_integration.py` | Full agent pipeline with `AI_PROVIDER=demo` |
 
 > **Note:** `test_integration.py` runs the full agent pipeline with

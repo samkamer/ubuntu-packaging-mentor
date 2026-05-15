@@ -83,7 +83,7 @@ class TestFormatDetectiveWarningsMOTU:
 
     def test_contains_policy_reference(self):
         result = _format_detective_warnings(self._make_warnings(), "MOTU")
-        assert "Policy" in result or "§7.6" in result
+        assert "Policy" in result or "§7.7" in result
 
     def test_contains_package_name(self):
         result = _format_detective_warnings(self._make_warnings(), "MOTU")

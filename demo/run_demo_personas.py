@@ -93,7 +93,7 @@ def session_beginner_audit(env: dict) -> None:
     time.sleep(0.8)
     slow_send(child, f"{SOURCE_DIR}\n")
 
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu")
     time.sleep(1.0)
     slow_send(child, "1\n")   # Audit
 
@@ -113,7 +113,7 @@ def session_beginner_audit(env: dict) -> None:
 def session_motu_detect(env: dict) -> None:
     """Session 2: MOTU persona → Detect skill (view only)."""
     title_card("SESSION 2 of 3 — MOTU Persona → Detect Skill", YELLOW)
-    print(f"{YELLOW}Notice the policy references (Debian Policy §7.6) in the guidance.{RESET}\n")
+    print(f"{YELLOW}Notice the policy references (Debian Policy §7.7) in the guidance.{RESET}\n")
     time.sleep(1.5)
 
     child = spawn_mentor(env)
@@ -126,7 +126,7 @@ def session_motu_detect(env: dict) -> None:
     time.sleep(0.8)
     slow_send(child, f"{SOURCE_DIR}\n")
 
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu")
     time.sleep(1.0)
     slow_send(child, "2\n")   # Detect
 
@@ -159,7 +159,7 @@ def session_coredev_scribe(env: dict) -> None:
     time.sleep(0.8)
     slow_send(child, f"{SOURCE_DIR}\n")
 
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu")
     time.sleep(1.0)
     slow_send(child, "3\n")   # Scribe
 

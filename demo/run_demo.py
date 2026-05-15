@@ -87,7 +87,7 @@ def run() -> None:
     slow_send(child, f"{SOURCE_DIR}\n")
 
     # ── Skill 1: Audit ────────────────────────────────────────────────────────
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu (1)")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu (1)")
     time.sleep(1.0)
     slow_send(child, "1\n")   # Audit
 
@@ -100,7 +100,7 @@ def run() -> None:
     slow_send(child, "y\n")   # continue to Detect
 
     # ── Skill 2: Detect ───────────────────────────────────────────────────────
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu (2)")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu (2)")
     time.sleep(1.5)
     slow_send(child, "2\n")   # Detect
 
@@ -113,7 +113,7 @@ def run() -> None:
     slow_send(child, "y\n")   # continue to Scribe
 
     # ── Skill 3: Scribe ───────────────────────────────────────────────────────
-    expect_or_die(child, r"Enter choice \[1-4\]", "skill menu (3)")
+    expect_or_die(child, r"Enter choice \[1-6\]", "skill menu (3)")
     time.sleep(1.5)
     slow_send(child, "3\n")   # Scribe
 

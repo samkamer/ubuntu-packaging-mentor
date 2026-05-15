@@ -337,7 +337,7 @@ def _format_detective_warnings(warnings: dict, persona_name: str) -> str | None:
 
     if persona_name == "MOTU":
         lines.append(
-            c(YELLOW, "  Per Debian Policy §7.6, all direct build-time deps must be explicit.")
+            c(YELLOW, "  Per Debian Policy §7.7, all direct build-time deps must be explicit.")
         )
         if fn_list:
             lines.append(c(YELLOW, "\n  Possibly missing (removed during dedup — reinstate if directly used):"))

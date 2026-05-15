@@ -83,8 +83,8 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # AWS STS temporary keys start with "ASIA"
     (re.compile(r"ASIA[0-9A-Z]{16}"),
      "aws_sts_key", "critical"),
-    # AWS secret access key: 40-char base64 value after assignment
-    (re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9+/]{40}"),
+    # AWS secret access key: 40-char base64 value, with or without surrounding quotes
+    (re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*[\"']?[A-Za-z0-9+/]{40}[\"']?"),
      "aws_secret_key", "critical"),
     # GitHub personal access tokens (classic: ghp_ prefix)
     (re.compile(r"ghp_[A-Za-z0-9_]{36}"),
@@ -98,8 +98,8 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # GitHub OAuth user-to-server tokens
     (re.compile(r"ghu_[A-Za-z0-9]{36}"),
      "github_oauth_token", "critical"),
-    # Hard-coded passwords: password = "value" or password: 'value'
-    (re.compile(r"(?i)password\s*=\s*[\"'][^\"'\s]{6,}[\"']"),
+    # Hard-coded passwords: password = "value" or password: 'value' (YAML/JSON/Python)
+    (re.compile(r"(?i)password\s*[=:]\s*[\"'][^\"'\s]{6,}[\"']"),
      "hardcoded_password", "high"),
     # API keys/tokens in assignment form (= or :), optionally JSON-quoted key
     (re.compile(r"(?i)\"?api_key\"?\s*[=:]\s*[\"'][A-Za-z0-9_\-]{16,}[\"']"),
@@ -149,8 +149,12 @@ _HARDENING_CATEGORIES: dict[str, str] = {
 
 _REMEDIATION_HARDENING = """\
 # Add to debian/rules (near the top, before any build rules):
-DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
+# The 'export' is required so dpkg-buildflags and debhelper subprocesses
+# inherit the variable (debian/rules is a Makefile; unexported variables are
+# not visible to child processes).
+#
 # This activates all hardening features via dpkg-buildflags(1):
 #   stackprotector  -fstack-protector-strong  (stack buffer overflow detection)
 #   fortify         -D_FORTIFY_SOURCE=2        (libc call safety checks)
@@ -267,8 +271,9 @@ def run_blhc(log_path: str) -> tuple[list[str], str, str]:
 
         hardening_status:
             "clean"    — blhc exited 0 (all flags present)
-            "findings" — blhc reported missing flags
-            "unknown"  — blhc not installed or timed out
+            "findings" — blhc exited non-zero and missing flag categories parsed
+            "unknown"  — blhc not installed, timed out, or exited non-zero with
+                         output that could not be matched to known flag categories
 
     If blhc is not installed, returns ([], "unknown", "").
     No heuristic fallback is performed: blhc is the authoritative tool for
@@ -298,7 +303,7 @@ def run_blhc(log_path: str) -> tuple[list[str], str, str]:
         if flag in raw:
             missing.append(cat)
 
-    status = "findings" if missing else "clean"
+    status = "findings" if missing else "unknown"
     return missing, status, raw
 
 
@@ -396,7 +401,8 @@ def _ask_llm(findings: list[dict], missing_flags: list[str]) -> tuple[str, str]:
         "(e.g. what Stack Smashing Protection prevents, why exposed credentials "
         "must be treated as compromised immediately).\n"
         "2. For hardening flags: confirm that "
-        "'DEB_BUILD_MAINT_OPTIONS = hardening=+all' in debian/rules resolves them "
+        "'export DEB_BUILD_MAINT_OPTIONS = hardening=+all' in debian/rules resolves them "
+        "(the 'export' is required so dpkg-buildflags subprocesses inherit the variable) "
         "and explain what each flag protects against.\n"
         "3. For exposed secrets: explain immediate remediation steps.\n"
         "Be concise and actionable."
