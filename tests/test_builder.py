@@ -3,6 +3,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -153,15 +154,20 @@ class TestBuildPublicApi:
 
     def test_failure_result_has_suggested_agent(self, tmp_path, monkeypatch):
         """Simulate a failed debuild and verify the result structure."""
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
-        # Patch run_debuild to return a fake failure
         import agents.builder as builder_mod
         monkeypatch.setattr(
             builder_mod, "run_debuild",
             lambda d: (1, "dpkg-checkbuilddeps: error: unmet build dependencies: libfoo-dev\n" * 25),
         )
-        result = build(str(tmp_path))
+        _mock_response = (
+            "ERROR_TYPE: missing_dependency\n"
+            "AGENT: detective\n"
+            f"COMMAND: python3 agents/detective.py {tmp_path} --write\n"
+            "ANALYSIS: Missing libfoo-dev from Build-Depends."
+        )
+        with patch("agents.builder.ask", return_value=_mock_response):
+            result = build(str(tmp_path))
         assert result["status"] == "error"
         assert result["suggested_agent"] in ("detective", "patch_manager", "auditor")
         assert result["suggested_command"] is not None
@@ -170,7 +176,6 @@ class TestBuildPublicApi:
 
     def test_success_result_structure(self, tmp_path, monkeypatch):
         """Simulate a successful debuild with no .changes file found (lintian skipped)."""
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
         import agents.builder as builder_mod
         monkeypatch.setattr(
@@ -188,7 +193,6 @@ class TestBuildPublicApi:
 
     def test_success_with_clean_lintian(self, tmp_path, monkeypatch):
         """Simulate a successful build where lintian also passes."""
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
         changes = tmp_path.parent / "foo_1.0_amd64.changes"
         changes.write_text("")
@@ -212,7 +216,6 @@ class TestBuildPublicApi:
 
     def test_success_with_lintian_errors_flips_status(self, tmp_path, monkeypatch):
         """Build succeeds but lintian finds errors → overall status becomes error."""
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
         changes = tmp_path.parent / "foo_1.0_amd64.changes"
         changes.write_text("")
@@ -224,6 +227,7 @@ class TestBuildPublicApi:
             linter_mod, "run_lintian",
             lambda t: (1, "E: foo: no-copyright-file\n", ""),
         )
+        monkeypatch.setattr(linter_mod, "ask", lambda *a, **kw: "Missing debian/copyright file.")
         result = build(str(tmp_path))
         assert result["status"] == "error"
         assert result["error_type"] == "lintian"
@@ -231,10 +235,10 @@ class TestBuildPublicApi:
         assert result["suggested_agent"] == "auditor"
 
     def test_log_tail_capped_at_constant(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "debian").mkdir()
         import agents.builder as builder_mod
         long_log = "\n".join(f"log line {i}" for i in range(200))
         monkeypatch.setattr(builder_mod, "run_debuild", lambda d: (1, long_log))
-        result = build(str(tmp_path))
+        with patch("agents.builder.ask", return_value="ANALYSIS: build failed"):
+            result = build(str(tmp_path))
         assert len(result["log_tail"].splitlines()) <= LOG_TAIL_LINES

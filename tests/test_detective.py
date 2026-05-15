@@ -11,6 +11,9 @@ from agents.detective import (
     _is_stdlib,
     _should_skip_dir,
     _PLATFORM_SKIP,
+    _rank_header_candidates,
+    _is_blocked_package,
+    _python_dedup,
     scan_build_system,
     scan_autoconf_deps,
 )
@@ -144,3 +147,129 @@ class TestScanAutoconfDeps:
     def test_returns_empty_for_no_build_files(self, tmp_path):
         results = scan_autoconf_deps(str(tmp_path))
         assert results == {}
+
+
+class TestRankHeaderCandidates:
+    """Tests for _rank_header_candidates path-based ranking."""
+
+    def test_exact_path_kept(self):
+        cands = [("libssl-dev", "/usr/include/openssl/ssl.h")]
+        result = _rank_header_candidates(cands, "openssl/ssl.h")
+        assert result == ["libssl-dev"]
+
+    def test_bundled_copy_dropped_when_exact_exists(self):
+        cands = [
+            ("libssl-dev", "/usr/include/openssl/ssl.h"),
+            ("apache2-dev", "/usr/include/apache2/openssl/ssl.h"),
+            ("dovecot-dev", "/usr/include/dovecot/openssl/ssl.h"),
+        ]
+        result = _rank_header_candidates(cands, "openssl/ssl.h")
+        assert result == ["libssl-dev"]
+        assert "apache2-dev" not in result
+        assert "dovecot-dev" not in result
+
+    def test_multiarch_path_tier1(self):
+        cands = [("libffi-dev", "/usr/include/x86_64-linux-gnu/ffi.h")]
+        result = _rank_header_candidates(cands, "ffi.h")
+        assert result == ["libffi-dev"]
+
+    def test_multiarch_preferred_over_deeper(self):
+        cands = [
+            ("libffi-dev", "/usr/include/x86_64-linux-gnu/ffi.h"),
+            ("some-other-dev", "/usr/include/compat/ffi.h"),
+        ]
+        result = _rank_header_candidates(cands, "ffi.h")
+        assert result[0] == "libffi-dev"
+        assert "some-other-dev" not in result  # dropped because tier1 exists
+
+    def test_fallback_to_deeper_when_no_canonical(self):
+        # mysql.h lives under /usr/include/mysql/mysql.h — no exact match
+        cands = [("libmysqlclient-dev", "/usr/include/mysql/mysql.h")]
+        result = _rank_header_candidates(cands, "mysql.h")
+        assert result == ["libmysqlclient-dev"]
+
+    def test_non_include_path_dropped(self):
+        cands = [("libfoo-dev", "/usr/lib/libfoo.so")]
+        result = _rank_header_candidates(cands, "foo.h")
+        assert result == []
+
+    def test_deduplication(self):
+        cands = [
+            ("libssl-dev", "/usr/include/openssl/ssl.h"),
+            ("libssl-dev", "/usr/include/openssl/ssl.h"),
+        ]
+        result = _rank_header_candidates(cands, "openssl/ssl.h")
+        assert result == ["libssl-dev"]
+
+    def test_empty_input(self):
+        assert _rank_header_candidates([], "openssl/ssl.h") == []
+
+    def test_simple_header_exact(self):
+        cands = [
+            ("zlib1g-dev", "/usr/include/zlib.h"),
+            ("lib32z1-dev", "/usr/lib32/usr/include/zlib.h"),
+        ]
+        result = _rank_header_candidates(cands, "zlib.h")
+        assert result == ["zlib1g-dev"]
+
+
+class TestIsBlockedPackage:
+    def test_android_blocked(self):
+        assert _is_blocked_package("android-liblog-dev")
+
+    def test_mingw_blocked(self):
+        assert _is_blocked_package("mingw-w64-x86-64-dev")
+
+    def test_wine_blocked(self):
+        assert _is_blocked_package("wine-dev")
+
+    def test_libwine_blocked(self):
+        assert _is_blocked_package("libwine-dev")
+
+    def test_golang_blocked(self):
+        assert _is_blocked_package("golang-github-foo-dev")
+
+    def test_libc6_dev_blocked(self):
+        assert _is_blocked_package("libc6-dev")
+
+    def test_linux_libc_dev_blocked(self):
+        assert _is_blocked_package("linux-libc-dev")
+
+    def test_libssl_dev_not_blocked(self):
+        assert not _is_blocked_package("libssl-dev")
+
+    def test_zlib_not_blocked(self):
+        assert not _is_blocked_package("zlib1g-dev")
+
+    def test_libcurl_not_blocked(self):
+        assert not _is_blocked_package("libcurl4-openssl-dev")
+
+
+class TestPythonDedup:
+    def test_removes_duplicates(self):
+        result = _python_dedup(["libssl-dev", "libssl-dev", "zlib1g-dev"])
+        assert result == ["libssl-dev", "zlib1g-dev"]
+
+    def test_removes_blocked(self):
+        result = _python_dedup(["libssl-dev", "libc6-dev", "android-liblog-dev"])
+        assert "libc6-dev" not in result
+        assert "android-liblog-dev" not in result
+        assert "libssl-dev" in result
+
+    def test_applies_name_corrections(self):
+        result = _python_dedup(["lib32z1-dev", "libssl-dev"])
+        assert "lib32z1-dev" not in result
+        assert "zlib1g-dev" in result
+
+    def test_skips_skip_marker(self):
+        # SKIP is filtered upstream but corrections/blocklist shouldn't crash on it
+        result = _python_dedup(["libssl-dev", "zlib1g-dev"])
+        assert result == ["libssl-dev", "zlib1g-dev"]
+
+    def test_sorted_output(self):
+        result = _python_dedup(["zlib1g-dev", "libssl-dev", "libcurl4-openssl-dev"])
+        assert result == sorted(result)
+
+    def test_empty_input(self):
+        assert _python_dedup([]) == []
+

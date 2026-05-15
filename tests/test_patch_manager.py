@@ -4,6 +4,7 @@ import sys
 import textwrap
 
 import pytest
+from unittest.mock import patch as mock_patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -169,25 +170,27 @@ class TestPatchPublicApi:
         assert "no patchable" in result["error"].lower()
 
     def test_dry_run_returns_dry_run_status(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "main.c").write_text("int main(){}\n")
-        result = patch(str(tmp_path), "fix-x", "Add a comment", dry_run=True)
+        _mock_diff = "--- a/main.c\n+++ b/main.c\n@@ -1 +1 @@\n-int main(){}\n+/* fix */ int main(){}\n"
+        with mock_patch("agents.patch_manager.ask", side_effect=["main.c", _mock_diff]):
+            result = patch(str(tmp_path), "fix-x", "Add a comment", dry_run=True)
         assert result["status"] == "dry_run"
         assert result["patch"] == "fix-x"
         assert result["file"] is not None
         assert result["written_to"] is None
 
     def test_dry_run_contains_diff(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "helper.py").write_text("def greet(): pass\n")
-        result = patch(str(tmp_path), "fix-greet", "Fix greeting", dry_run=True)
+        _mock_diff = "--- a/helper.py\n+++ b/helper.py\n@@ -1 +1 @@\n-def greet(): pass\n+def greet(): return 'hi'\n"
+        with mock_patch("agents.patch_manager.ask", side_effect=["helper.py", _mock_diff]):
+            result = patch(str(tmp_path), "fix-greet", "Fix greeting", dry_run=True)
         assert "diff" in result
         assert result["agent"] == "patch_manager"
 
     def test_patch_name_without_extension(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         (tmp_path / "run.sh").write_text("#!/bin/bash\necho hello\n")
-        result = patch(str(tmp_path), "my-fix", "fix something", dry_run=True)
+        _mock_diff = "--- a/run.sh\n+++ b/run.sh\n@@ -2 +2 @@\n-echo hello\n+echo fixed\n"
+        with mock_patch("agents.patch_manager.ask", side_effect=["run.sh", _mock_diff]):
+            result = patch(str(tmp_path), "my-fix", "fix something", dry_run=True)
         assert result["status"] == "dry_run"
-        # Patch name stored without .patch in dry_run
         assert result["patch"] == "my-fix"

@@ -338,15 +338,143 @@ def _apt_file_search(query: str) -> list[str]:
     return packages
 
 
+def _apt_file_search_with_paths(query: str) -> list[tuple[str, str]]:
+    """Run apt-file search and return (package, filepath) tuples."""
+    if shutil.which("apt-file") is None:
+        return []
+    result = subprocess.run(
+        ["apt-file", "search", query],
+        capture_output=True, text=True, timeout=15,
+    )
+    out = []
+    for line in result.stdout.splitlines():
+        if ": " in line:
+            pkg, _, path = line.partition(": ")
+            out.append((pkg.strip(), path.strip()))
+    return out
+
+
+# ── Canonical include path ranking ───────────────────────────────────────────
+
+_ARCH_TRIPLET_RE = re.compile(r'^[a-z0-9_]+-linux-[a-z0-9_-]+$')
+
+
+def _rank_header_candidates(
+    candidates_with_paths: list[tuple[str, str]], header: str
+) -> list[str]:
+    """
+    Return dev-package candidates sorted by how canonical the include path is.
+
+    Tier 0 — exact:     /usr/include/<header>
+    Tier 1 — multiarch: /usr/include/<arch-triplet>/<header>
+    Tier 2 — deeper:    any other /usr/include/**  path (versioned subdirs, etc.)
+
+    When tier-0 or tier-1 candidates exist, tier-2 packages (bundled copies in
+    other package trees) are dropped entirely.  This eliminates the large class
+    of false positives where e.g. apache2-dev ships a copy of openssl/ssl.h at
+    /usr/include/apache2/openssl/ssl.h.  When only tier-2 exists (e.g. mysql.h
+    lives under /usr/include/mysql/), those packages are kept as the fallback.
+    Returns a deduplicated list.
+    """
+    inc = "/usr/include/"
+    tier0: list[str] = []
+    tier1: list[str] = []
+    tier2: list[str] = []
+
+    for pkg, path in candidates_with_paths:
+        if not path.startswith(inc):
+            continue  # not a /usr/include/ path — drop
+        rest = path[len(inc):]
+        if rest == header:
+            tier0.append(pkg)
+        else:
+            segs = rest.split("/")
+            if len(segs) >= 2 and _ARCH_TRIPLET_RE.match(segs[0]) and "/".join(segs[1:]) == header:
+                tier1.append(pkg)
+            else:
+                tier2.append(pkg)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    # Use tier2 only when no canonical (tier0/tier1) packages exist
+    source = tier0 + tier1 if (tier0 or tier1) else tier2
+    for pkg in source:
+        if pkg not in seen:
+            seen.add(pkg)
+            result.append(pkg)
+    return result
+
+
+# ── Package filtering ─────────────────────────────────────────────────────────
+
+# Package name prefixes that should never appear in a native Linux Build-Depends
+_PACKAGE_BLOCKLIST_PREFIXES = (
+    "android-",    # Android cross-compile toolchains
+    "mingw-w64-",  # Windows cross-compile
+    "libwine",     # Wine compatibility layer
+    "wine-",       # Wine
+    "golang-",     # Go language packages (not native C deps)
+    "fp-",         # FreePascal
+    "fpc-",        # FreePascal compiler
+    "lazarus-",    # Lazarus IDE
+)
+
+# Exact package names that are always available via build-essential or the build
+# environment and should never appear explicitly in Build-Depends
+_PACKAGE_BLOCKLIST_EXACT = frozenset({
+    "libc6-dev",
+    "linux-libc-dev",
+    "libc-dev-bin",
+    "libgcc-dev",
+    "gcc",
+    "make",
+})
+
+# Corrections for packages commonly mis-selected by apt-file (e.g. 32-bit
+# variants returned instead of the canonical 64-bit -dev package)
+_PACKAGE_NAME_CORRECTIONS: dict[str, str] = {
+    "lib32z1-dev": "zlib1g-dev",
+}
+
+
+def _is_blocked_package(pkg: str) -> bool:
+    """Return True if pkg should be excluded from Build-Depends."""
+    if pkg in _PACKAGE_BLOCKLIST_EXACT:
+        return True
+    return any(pkg.startswith(p) for p in _PACKAGE_BLOCKLIST_PREFIXES)
+
+
+def _python_dedup(candidates: list[str]) -> list[str]:
+    """
+    Pure-Python deduplication: apply name corrections, remove blocked packages,
+    and deduplicate.  Used as a pre-pass before (or as a fallback for) the LLM.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for pkg in candidates:
+        pkg = _PACKAGE_NAME_CORRECTIONS.get(pkg, pkg)
+        if _is_blocked_package(pkg):
+            continue
+        if pkg not in seen:
+            seen.add(pkg)
+            result.append(pkg)
+    return sorted(result)
+
+
 def resolve_c_headers(headers: set[str]) -> dict[str, list[str]]:
-    """Map each C header to candidate apt packages (filtered to -dev packages)."""
+    """Map each C header to candidate apt packages, ranked by canonical path."""
     results = {}
     total = len(headers)
     for i, header in enumerate(sorted(headers), 1):
         print(f"  [apt-file {i}/{total}] searching: {header}", file=sys.stderr)
-        candidates = _apt_file_search(header)
-        dev_pkgs = [p for p in candidates if p.endswith("-dev")]
-        results[header] = dev_pkgs if dev_pkgs else candidates[:5]
+        candidates_with_paths = _apt_file_search_with_paths(header)
+        # Filter to -dev packages first
+        dev_with_paths = [(p, path) for p, path in candidates_with_paths if p.endswith("-dev")]
+        # Rank: exact → multiarch → deeper; drop bundled-copy noise when canonical exists
+        ranked = _rank_header_candidates(dev_with_paths, header)
+        # Apply package blocklist
+        ranked = [p for p in ranked if not _is_blocked_package(p)]
+        results[header] = ranked[:6] if ranked else []
     return results
 
 
@@ -456,31 +584,42 @@ def _parse_json_list(text: str) -> list[str] | None:
 
 def deduplicate_with_llm(raw_deps: list[str]) -> list[str]:
     """
-    Send the full collected package list to the LLM for a final deduplication pass.
-    Removes redundant packages (e.g. libssl-dev when libcurl4-openssl-dev already pulls it),
-    wrong entries, and SKIP placeholders. Falls back to simple set dedup on failure.
+    Deduplicate the raw package list using a Python pre-pass followed by an
+    optional LLM cleanup.
+
+    Python pre-pass: applies name corrections, removes blocked/always-available
+    packages, and deduplicates.  The LLM then removes transitively-pulled and
+    redundant entries.  Falls back to the Python-only result if the LLM fails.
     """
-    # Strip any SKIP placeholders from apt-file fallback
-    candidates = sorted({d for d in raw_deps if d and d.upper() != "SKIP"})
+    # Python pre-pass: corrections + blocklist + exact dedup
+    candidates = _python_dedup([d for d in raw_deps if d and d.upper() != "SKIP"])
 
     if not candidates:
         return []
 
     user_prompt = (
-        "Below is a raw list of Ubuntu/Debian packages collected for Build-Depends. "
-        "Please deduplicate it: remove redundant entries, non-dev packages that are "
-        "pulled in transitively, and anything that isn't a real apt package name. "
-        "Return ONLY a JSON list of the final Build-Depends packages.\n\n"
+        "Below is a list of Ubuntu/Debian packages collected for Build-Depends. "
+        "Deduplicate and clean it:\n"
+        "  • Remove packages pulled in transitively by others in the list\n"
+        "  • Remove build-essential packages (gcc, make, libc6-dev, etc.)\n"
+        "  • Remove cross-compilation toolchain packages (mingw, android, wine)\n"
+        "  • When multiple packages provide the same functionality, keep only the "
+        "primary/canonical one (e.g. if libssl-dev is listed alongside a higher-level "
+        "library that already depends on it, remove the redundant lower-level entry)\n"
+        "  • Keep only valid apt package names that belong in debian/control Build-Depends\n"
+        "Return ONLY a JSON array of the final package names.\n\n"
         f"Raw list: {json.dumps(candidates)}"
     )
     try:
         response = ask(_SYSTEM_PROMPT, user_prompt, label="Deduplicating Build-Depends")
         result = _parse_json_list(response)
         if result:
+            # Apply Python corrections to LLM output too
+            result = _python_dedup(result)
             return sorted(result)
-        print("  [~] Could not parse dedup JSON — using sorted set", file=sys.stderr)
+        print("  [~] Could not parse dedup JSON — using Python dedup result", file=sys.stderr)
     except RuntimeError as e:
-        print(f"  [~] Dedup LLM call failed ({e}) — using sorted set", file=sys.stderr)
+        print(f"  [~] Dedup LLM call failed ({e}) — using Python dedup result", file=sys.stderr)
 
     return candidates
 

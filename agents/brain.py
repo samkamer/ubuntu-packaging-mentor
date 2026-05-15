@@ -401,7 +401,7 @@ def ask(system_prompt: str, user_prompt: str,
         RuntimeError: On connection failure, timeout, or provider error.
     """
     provider_fn = {"ollama": _ask_ollama, "copilot": _ask_copilot,
-                   "demo": _ask_demo}.get(AI_PROVIDER, _ask_ollama)
+                   "demo": _ask_demo}.get(os.environ.get("AI_PROVIDER", "ollama").lower(), _ask_ollama)
 
     if label:
         with Spinner(label):

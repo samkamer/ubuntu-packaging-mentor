@@ -3,6 +3,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -135,7 +136,6 @@ class TestLintPublicApi:
         assert len(result["warnings"]) == 1
 
     def test_errors_return_error_status(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         deb = tmp_path / "foo_1.0_all.deb"
         deb.write_bytes(b"fake")
         import agents.linter as linter_mod
@@ -144,13 +144,13 @@ class TestLintPublicApi:
             "run_lintian",
             lambda t: (1, "E: foo: no-copyright-file\n", ""),
         )
-        result = lint(str(deb))
+        with patch("agents.linter.ask", return_value="Missing copyright file — add debian/copyright."):
+            result = lint(str(deb))
         assert result["status"] == "error"
         assert len(result["errors"]) == 1
         assert result["errors"][0]["tag"] == "no-copyright-file"
 
     def test_errors_include_analysis(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("AI_PROVIDER", "demo")
         deb = tmp_path / "foo_1.0_all.deb"
         deb.write_bytes(b"fake")
         import agents.linter as linter_mod
@@ -159,7 +159,8 @@ class TestLintPublicApi:
             "run_lintian",
             lambda t: (1, "E: foo: no-copyright-file\nE: foo: bad-distribution-in-changes-file\n", ""),
         )
-        result = lint(str(deb))
+        with patch("agents.linter.ask", return_value="Two errors found. Add debian/copyright and fix distribution."):
+            result = lint(str(deb))
         assert result["analysis"] is not None
         assert len(result["analysis"]) > 0
 
