@@ -16,6 +16,7 @@ run_detect = None
 run_scribe = None
 run_patch  = None
 run_build  = None
+run_guard  = None
 
 # ── Persona definitions ────────────────────────────────────────────────────────
 
@@ -98,6 +99,11 @@ SKILLS = {
         "agent": "builder.py",
         "description": "Package build — runs debuild and analyses failures with AI.",
     },
+    "6": {
+        "name": "Guard",
+        "agent": "guardian.py",
+        "description": "Security audit — scans for secrets and checks hardening flags.",
+    },
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -173,6 +179,16 @@ _EXPLAIN_PROMPTS = {
             "agent (detective, patch_manager, or auditor) to run to fix it.\n"
             "Explain what debuild does, what a binary build produces, and why build testing matters."
         ),
+        "Guard": (
+            "The user is about to run the Guard skill on a source package directory.\n"
+            "The tool has two parts: (1) a secret scanner that recursively searches "
+            "all source files for exposed private keys, API tokens, passwords, and "
+            "cloud credentials; (2) a hardening auditor that checks the build log "
+            "for missing compiler security flags mandated by Ubuntu/Debian Policy §10.1.\n"
+            "Explain why exposed secrets are critical, what compiler hardening flags "
+            "like -fstack-protector-strong and -D_FORTIFY_SOURCE=2 protect against, "
+            "and why running this audit before uploading to the archive matters."
+        ),
     },
     "before_write": {
         "Audit": (
@@ -204,6 +220,13 @@ _EXPLAIN_PROMPTS = {
             "Explain what this command does, what output files it produces, "
             "and what a successful build result looks like."
         ),
+        "Guard": (
+            "The Guard agent is about to scan the source tree for secrets and, "
+            "if a build log is available, check hardening flags with blhc.\n"
+            "Remind the user that secret scanning covers all text files recursively "
+            "(no secret values are stored — only file and line number are reported), "
+            "and that the hardening audit requires blhc to be installed."
+        ),
     },
     "post_result": {
         "Audit": (
@@ -232,6 +255,13 @@ _EXPLAIN_PROMPTS = {
             "If it failed, explain the error type identified and why the suggested agent "
             "and command will resolve it."
         ),
+        "Guard": (
+            "The Guard agent has completed its security audit.\n"
+            "Explain what the security score means (it is a heuristic, not a compliance "
+            "certificate), how to interpret each vulnerability type, and what the "
+            "remediation steps in the output mean.  If secrets were found, emphasise that "
+            "they must be rotated immediately — not just removed from the repository."
+        ),
     },
     "on_error": {
         "Audit":  "The Audit agent reported an error running licensecheck on the package source.",
@@ -239,6 +269,7 @@ _EXPLAIN_PROMPTS = {
         "Scribe": "The Scribe agent reported an error generating the changelog entry.",
         "Patch":  "The Patch agent reported an error generating or applying the quilt patch.",
         "Build":  "The Build agent reported an error running debuild.",
+        "Guard":  "The Guard agent reported an error during security scanning.",
     },
 }
 
@@ -249,6 +280,7 @@ _COREDEV_SUMMARY = {
     "Scribe": lambda r: "changelog entry drafted.",
     "Patch":  lambda r: f"patch {r.get('patch','')} applied to {r.get('file','')}.",
     "Build":  lambda r: "Build succeeded." if r.get("status") == "success" else f"Build failed: {r.get('error_type','unknown')} → {r.get('suggested_agent')}.",
+    "Guard":  lambda r: f"Score: {r.get('security_score','?')}/100 — {r.get('verdict','?')}. Secrets: {r.get('secrets_found',0)}. Missing flags: {len(r.get('missing_flags',[]))}.",
 }
 
 
@@ -260,6 +292,93 @@ def _show_write_status(result: dict) -> None:
             print(c(YELLOW, f"  ↩ Backup saved: {result['backed_up']}"))
     else:
         print(c(YELLOW, "\n(Not written to disk — answer 'y' at the prompt to save)"))
+
+
+def _find_build_log(source_dir: str) -> str | None:
+    """
+    Locate the most recent build log saved by builder.py for this package.
+
+    Checks lab/builds/<pkg_name>/build.log relative to the project root.
+    Returns the path if the file exists, otherwise None.
+    """
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    pkg_name = os.path.basename(os.path.abspath(source_dir))
+    candidate = os.path.join(project_root, "lab", "builds", pkg_name, "build.log")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _format_detective_warnings(warnings: dict, persona_name: str) -> str | None:
+    """
+    Format detective pipeline warnings for the contributor.
+
+    Returns a formatted string, or None if there are no warnings to show.
+    Persona determines verbosity:
+      Beginner  — plain English guidance on what to check and why
+      MOTU      — technical list with Debian Policy reference
+      CoreDev   — raw JSON diff of pipeline decisions
+    """
+    if not warnings:
+        return None
+
+    fn_list  = warnings.get("possible_false_negatives", [])
+    fp_list  = warnings.get("possible_false_positives", [])
+    corr     = warnings.get("name_corrections", [])
+    blocked  = warnings.get("blocklisted", [])
+
+    if not any([fn_list, fp_list, corr, blocked]):
+        return None
+
+    if persona_name == "CoreDev":
+        return c(YELLOW, "\n── Detective pipeline log ──────────────────────────\n") + \
+               json.dumps(warnings, indent=2) + \
+               "\n" + c(YELLOW, "────────────────────────────────────────────────────")
+
+    lines = [c(YELLOW, "\n── Build-Depends verification needed ───────────────")]
+
+    if persona_name == "MOTU":
+        lines.append(
+            c(YELLOW, "  Per Debian Policy §7.7, all direct build-time deps must be explicit.")
+        )
+        if fn_list:
+            lines.append(c(YELLOW, "\n  Possibly missing (removed during dedup — reinstate if directly used):"))
+            for item in fn_list:
+                lines.append(f"    {item['pkg']}")
+        if fp_list:
+            lines.append(c(YELLOW, "\n  Competing implementations detected (keep one matching your build profile):"))
+            for item in fp_list:
+                lines.append(f"    {item['pkg']}  ← {item['reason']}")
+        if corr:
+            lines.append(c(YELLOW, "\n  Automatic name corrections applied:"))
+            for item in corr:
+                lines.append(f"    {item['from']}  →  {item['to']}")
+        if blocked:
+            lines.append(c(YELLOW, "\n  Filtered (always available or platform-specific):"))
+            for item in blocked:
+                lines.append(f"    {item['pkg']}  ({item['reason']})")
+
+    else:  # Beginner
+        if fn_list:
+            lines.append(c(YELLOW, "\n  ⚠ These packages were found in your source but filtered out."))
+            lines.append(  "    Add them back if your package actually uses them:")
+            for item in fn_list:
+                lines.append(f"    • {item['pkg']}")
+        if fp_list:
+            lines.append(c(YELLOW, "\n  ⚠ These packages may not all be needed at the same time."))
+            lines.append(  "    Usually only one implementation of each library is required.")
+            lines.append(  "    Delete the ones you are not using:")
+            for item in fp_list:
+                lines.append(f"    • {item['pkg']}")
+        if corr:
+            lines.append(c(YELLOW, "\n  ✓ These package names were auto-corrected to Ubuntu naming:"))
+            for item in corr:
+                lines.append(f"    • {item['from']}  →  {item['to']}")
+        if blocked:
+            lines.append(c(YELLOW, "\n  ✓ These were removed (already in every Ubuntu build environment):"))
+            for item in blocked:
+                lines.append(f"    • {item['pkg']}")
+
+    lines.append(c(YELLOW, "────────────────────────────────────────────────────"))
+    return "\n".join(lines)
 
 
 def _persona_explain(touchpoint: str, skill_name: str, persona: dict,
@@ -344,6 +463,21 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         _persona_explain("before_write", sname, persona, label="Build: context")
         result = run_build(target)
 
+    elif sname == "Guard":
+        _persona_explain("before_write", sname, persona, label="Guard: context")
+        # Auto-detect build log from the last builder run, or let user override
+        auto_log = _find_build_log(target)
+        if auto_log:
+            print(c(CYAN, f"\n  Auto-detected build log: {auto_log}"))
+            use_auto = prompt("Use this build log for hardening audit? [Y/n]:").lower()
+            build_log_path = auto_log if use_auto != "n" else None
+        else:
+            print(c(YELLOW, "\n  No build log found — hardening audit will be skipped."))
+            print(c(YELLOW, "  Run the Build skill first, or provide a path manually."))
+            manual = prompt("Enter build log path (or press Enter to skip):")
+            build_log_path = manual if manual and os.path.isfile(manual) else None
+        result = run_guard(target, build_log_path)
+
     else:
         result = {"status": "error", "error": f"Unknown skill: {sname}",
                   "agent": sname.lower()}
@@ -379,6 +513,10 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
                 print(c(CYAN, f"  {_COREDEV_SUMMARY['Detect'](result)}"))
         else:
             print(c(YELLOW, "\nNo external dependencies detected."))
+        warnings = result.get("data", {}).get("warnings", {})
+        warn_str = _format_detective_warnings(warnings, persona["name"])
+        if warn_str:
+            print(warn_str)
 
     elif sname == "Scribe" and result.get("data"):
         print(c(CYAN, "\n── Generated debian/changelog entry ────────────────"))
@@ -407,6 +545,9 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
         if result.get("status") == "success":
             print(c(GREEN, f"\n  ✓ {result['message']}"))
             print(c(CYAN,  f"  Build log lines: {result.get('log_lines', '?')}"))
+            if result.get("build_log_path"):
+                print(c(CYAN, f"  Build log saved: {result['build_log_path']}"))
+                print(c(YELLOW, "  Tip: run the Guard skill to check hardening flags."))
             if is_coredev:
                 print(c(CYAN, f"  {_COREDEV_SUMMARY['Build'](result)}"))
         else:
@@ -420,6 +561,53 @@ def run_skill(skill: dict, target: str, persona: dict) -> None:
             print(c(CYAN,   "───────────────────────────────────────────────────"))
             if is_coredev:
                 print(c(CYAN, f"  {_COREDEV_SUMMARY['Build'](result)}"))
+
+    elif sname == "Guard":
+        verdict  = result.get("verdict", "unknown")
+        score    = result.get("security_score", "?")
+        verdict_color = GREEN if verdict == "pass" else (YELLOW if verdict == "warn" else RED)
+
+        print(c(verdict_color, f"\n  Security score : {score}/100 (heuristic)"))
+        print(c(verdict_color, f"  Verdict        : {verdict.upper()}"))
+
+        vulns = result.get("vulnerabilities", [])
+        if vulns:
+            print(c(CYAN, "\n── Vulnerabilities ────────────────────────────────"))
+            for v in vulns:
+                sev = v.get("severity", "?").upper()
+                sev_color = RED if sev == "CRITICAL" else (YELLOW if sev == "HIGH" else CYAN)
+                if v.get("type") == "secret":
+                    print(c(sev_color,
+                            f"  [{sev}] {v['match_type']}  "
+                            f"{v['file']}:{v['line_number']}"))
+                else:
+                    print(c(sev_color,
+                            f"  [{sev}] {v.get('description', v.get('match_type', ''))}"))
+            print(c(CYAN, "────────────────────────────────────────────────────"))
+        else:
+            print(c(GREEN, "\n  No vulnerabilities found."))
+
+        hstatus = result.get("hardening_status", "skipped")
+        hreason = result.get("hardening_reason")
+        if hstatus == "unknown":
+            print(c(YELLOW, "\n  Hardening status: unknown (blhc unavailable, timed out, or output unrecognized)"))
+            if hreason == "blhc_not_installed":
+                print(c(YELLOW, "  Install with: sudo apt install blhc"))
+        elif hstatus == "skipped":
+            print(c(YELLOW, "\n  Hardening audit skipped (no build log provided)."))
+
+        if result.get("remediation_code"):
+            print(c(CYAN, "\n── Remediation ──────────────────────────────────────"))
+            print(result["remediation_code"].strip())
+            print(c(CYAN, "─────────────────────────────────────────────────────"))
+
+        if not is_coredev and result.get("llm_explanation"):
+            print(c(GREEN, "\n── Security Explanation ─────────────────────────────"))
+            print(result["llm_explanation"].strip())
+            print(c(GREEN, "─────────────────────────────────────────────────────"))
+
+        if is_coredev:
+            print(c(CYAN, f"  {_COREDEV_SUMMARY['Guard'](result)}"))
 
     else:
         print(json.dumps(result, indent=2))
@@ -473,6 +661,7 @@ def main() -> None:
     from agents.scribe import scribe as _run_scribe
     from agents.patch_manager import patch as _run_patch
     from agents.builder import build as _run_build
+    from agents.guardian import audit as _run_guard
 
     # Populate module-level names used by run_skill / _persona_explain
     _self.ask        = _ask
@@ -481,6 +670,7 @@ def main() -> None:
     _self.run_scribe = _run_scribe
     _self.run_patch  = _run_patch
     _self.run_build  = _run_build
+    _self.run_guard  = _run_guard
 
     print(c(BOLD, BANNER))
 
@@ -502,7 +692,7 @@ def main() -> None:
     # 3. Main skill loop
     while True:
         print_menu("Select a skill:", SKILLS)
-        choice = prompt("Enter choice [1-5]:")
+        choice = prompt("Enter choice [1-6]:")
 
         if choice == "q":
             print(c(GREEN, "\nGoodbye!\n"))

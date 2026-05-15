@@ -242,3 +242,42 @@ class TestBuildPublicApi:
         with patch("agents.builder.ask", return_value="ANALYSIS: build failed"):
             result = build(str(tmp_path))
         assert len(result["log_tail"].splitlines()) <= LOG_TAIL_LINES
+
+    def test_success_saves_build_log_and_sets_build_log_path(self, tmp_path, monkeypatch):
+        (tmp_path / "debian").mkdir()
+        import agents.builder as builder_mod
+        full_log = "dpkg-deb: building package 'hello' in '../hello_1.0_amd64.deb'\n"
+        monkeypatch.setattr(
+            builder_mod, "run_debuild",
+            lambda d: (0, full_log),
+        )
+        monkeypatch.setattr(builder_mod, "_find_changes_file", lambda d, l: None)
+        monkeypatch.setattr(builder_mod.shutil, "which", lambda cmd: "/usr/bin/debuild" if cmd == "debuild" else None)
+        monkeypatch.setattr(builder_mod, "_LAB_BUILDS_DIR", str(tmp_path / "lab-builds"))
+
+        result = build(str(tmp_path))
+
+        assert result["status"] == "success"
+        assert result["build_log_path"] is not None
+        assert os.path.isfile(result["build_log_path"])
+        with open(result["build_log_path"], encoding="utf-8") as fh:
+            assert fh.read() == full_log
+
+    def test_failure_saves_build_log_and_sets_build_log_path(self, tmp_path, monkeypatch):
+        (tmp_path / "debian").mkdir()
+        import agents.builder as builder_mod
+        full_log = "dpkg-checkbuilddeps: error: unmet build dependencies: libfoo-dev\n"
+        monkeypatch.setattr(
+            builder_mod, "run_debuild",
+            lambda d: (1, full_log),
+        )
+        monkeypatch.setattr(builder_mod.shutil, "which", lambda cmd: "/usr/bin/debuild" if cmd == "debuild" else None)
+        monkeypatch.setattr(builder_mod, "_LAB_BUILDS_DIR", str(tmp_path / "lab-builds"))
+        with patch("agents.builder.ask", return_value="ANALYSIS: build failed"):
+            result = build(str(tmp_path))
+
+        assert result["status"] == "error"
+        assert result["build_log_path"] is not None
+        assert os.path.isfile(result["build_log_path"])
+        with open(result["build_log_path"], encoding="utf-8") as fh:
+            assert fh.read() == full_log

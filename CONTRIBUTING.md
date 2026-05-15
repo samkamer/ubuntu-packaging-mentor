@@ -54,8 +54,50 @@ and env vars set.**
 
 Set via env var or config file `[llm] provider`. Env vars override config.
 
-To add a canned demo response for a new agent, add an entry to the
-`_DEMO_RESPONSES` dict in `brain.py` keyed by a substring of the system prompt.
+---
+
+## Demo mode internals
+
+`AI_PROVIDER=demo` routes every `ask()` call to `_ask_demo()` in `brain.py`
+instead of a real LLM. It serves two purposes:
+
+- **Demo recording** — instant, deterministic output for `asciinema` recordings
+  without waiting for Ollama. A 1-second sleep keeps the spinner visible.
+- **Integration tests** — `tests/test_integration.py` sets `AI_PROVIDER=demo`
+  so the full agent pipeline runs fast and offline.
+
+### How `_ask_demo` works
+
+`_ask_demo` selects a canned response by matching substrings in the prompt:
+
+```python
+if "deduplic" in user_prompt.lower():
+    return '["libssl-dev", "zlib1g-dev", "debhelper-compat (= 13)"]'
+if "build-depends" in up and "header" in up:
+    return "libssl-dev"
+# … one branch per agent touchpoint
+```
+
+### Critical coupling: prompt text ↔ demo keywords
+
+If you change the wording of any agent prompt, check whether `_ask_demo` has
+a matching branch. If the keyword no longer appears in the new prompt, the demo
+branch silently falls through to a generic fallback — integration tests that
+depend on a specific canned response will fail or return unexpected data.
+
+**Example:** Renaming the dedup prompt from *"Deduplicate and clean…"* to
+*"Clean it up…"* broke the `"deduplic" in up` branch. The fix was to keep
+the word "Deduplicate" in the new prompt.
+
+**Rule:** When changing an agent prompt, grep `brain.py` for any keyword that
+matched the old wording and update it if necessary:
+
+```bash
+grep -n "deduplic\|build-depends\|spdx\|changelog\|summarise" agents/brain.py
+```
+
+To add a canned response for a new agent, add an `if` branch inside
+`_ask_demo()` in `brain.py` keyed by a distinctive substring of the prompt.
 
 ---
 
@@ -74,13 +116,20 @@ All tests must pass before opening a PR. The suite currently covers:
 | File | What it tests |
 |------|--------------|
 | `test_auditor.py` | DEP-5 generation, SPDX normalisation, write/backup |
-| `test_detective.py` | Header scanning, apt-file resolution, Build-Depends formatting |
+| `test_detective.py` | Header scanning, apt-file resolution, Build-Depends formatting, warnings pipeline |
 | `test_scribe.py` | Changelog formatting, git log parsing, fallback stub |
 | `test_patch_manager.py` | Diff generation, quilt workflow, dry-run mode |
 | `test_builder.py` | debuild invocation, log parsing, lintian integration |
 | `test_linter.py` | Lintian output parsing, E:/W: classification, LLM trigger |
 | `test_config.py` | INI read/write, None omission, XDG path, corrupt file |
 | `test_preflight.py` | Tool detection, Ollama probing, run_setup output and config |
+| `test_mentor_warnings.py` | Per-persona detective warnings formatting |
+| `test_guardian.py` | Secret scanner patterns, blhc hardening audit, scoring algorithm, symlink safety, full audit pipeline |
+| `test_integration.py` | Full agent pipeline with `AI_PROVIDER=demo` |
+
+> **Note:** `test_integration.py` runs the full agent pipeline with
+> `AI_PROVIDER=demo`. If you change agent prompt wording, verify that
+> `_ask_demo()` in `brain.py` still matches — see **Demo mode internals** above.
 
 ---
 
@@ -151,7 +200,20 @@ python3 agents/detective.py <source_dir> [--write]
   "status": "success",
   "dependencies": ["libssl-dev", "zlib1g-dev"],
   "agent": "detective",
-  "written_to": null
+  "written_to": null,
+  "data": {
+    "build_depends": ["libssl-dev", "zlib1g-dev"],
+    "warnings": {
+      "possible_false_negatives": [
+        {"pkg": "libbrotli-dev", "reason": "detected in source but removed during deduplication; verify manually"}
+      ],
+      "possible_false_positives": [
+        {"pkg": "libngtcp2-crypto-gnutls-dev", "reason": "competing implementation — multiple packages from ngtcp2/ header namespace"}
+      ],
+      "name_corrections": [{"from": "libldap-dev", "to": "libldap2-dev"}],
+      "blocklisted": [{"pkg": "libc6-dev", "reason": "always available via build-essential"}]
+    }
+  }
 }
 ```
 

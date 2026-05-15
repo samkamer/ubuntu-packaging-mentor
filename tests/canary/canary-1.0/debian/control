@@ -1,0 +1,14 @@
+Source: canary
+Section: misc
+Priority: optional
+Maintainer: Guardian Test <guardian@example.com>
+Build-Depends: debhelper-compat (= 13), gcc
+Standards-Version: 4.6.0
+
+Package: canary
+Architecture: any
+Description: Guardian validation canary package
+ Synthetic package containing deliberate fake secrets and missing hardening
+ flags, used to validate the guardian security agent end-to-end.
+ .
+ NOT FOR UPLOAD. All credentials are intentionally fake test vectors.

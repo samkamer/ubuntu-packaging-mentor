@@ -18,6 +18,7 @@ Returns JSON:
 """
 
 import ast
+import functools
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,12 +66,18 @@ _PLATFORM_SKIP = re.compile(r"""
       # AmigaOS / BeOS
       proto/ | bsdsocket | amitcp |
       # OS/2 / DOS / RISCOS
-      os2\.h | dos\.h | unixlib |
+      os2\.h | dos\.h | unixlib | alloc\.h |
+      # CPU-architecture-specific intrinsics — provided by gcc on the native arch,
+      # never a -dev package Build-Depends on a cross-arch Ubuntu build
+      altivec\.h | vecintrin\.h | mmintrin\.h | immintrin\.h | arm_neon\.h |
       # Generic C runtime headers we can ignore (always available via libc-dev)
       assert\.h | ctype\.h | errno\.h | float\.h | limits\.h | locale\.h |
       math\.h | setjmp\.h | signal\.h | stdarg\.h | stddef\.h | stdio\.h |
       stdlib\.h | string\.h | time\.h | wchar\.h | wctype\.h |
       stdint\.h | inttypes\.h | stdbool\.h | stdatomic\.h | uchar\.h |
+      # POSIX networking — always provided by glibc (libc6-dev / libc-dev)
+      # apt-file returns dietlibc/emscripten noise for these
+      netdb\.h | iconv\.h |
       # C++ STL
       string$ | cstdlib | cstring
     )
@@ -248,7 +256,10 @@ def scan_c_headers(source_dir: str) -> set[str]:
     Skips platform-specific headers and non-Linux directories.
     """
     headers = set()
-    pattern = re.compile(r'#\s*include\s+<([^>]+)>')
+    # Anchored to line start: avoids matching #include inside comments or
+    # patch diff context lines that happen to mention an include.
+    pattern = re.compile(r'^\s*#\s*include\s+<([^>]+)>')
+    libc_skip = _build_libc_header_skip()
     for root, dirs, files in os.walk(source_dir):
         # Prune skip dirs in-place so os.walk doesn't descend into them
         dirs[:] = [d for d in dirs if not _should_skip_dir(d)]
@@ -260,10 +271,11 @@ def scan_c_headers(source_dir: str) -> set[str]:
                         for i, line in enumerate(fh):
                             if i > 200:
                                 break
-                            m = pattern.search(line)
+                            m = pattern.match(line)
                             if m:
                                 header = m.group(1)
-                                if not _PLATFORM_SKIP.match(header):
+                                if (not _PLATFORM_SKIP.match(header)
+                                        and header not in libc_skip):
                                     headers.add(header)
                 except OSError:
                     pass
@@ -359,6 +371,48 @@ def _apt_file_search_with_paths(query: str) -> list[tuple[str, str]]:
 _ARCH_TRIPLET_RE = re.compile(r'^[a-z0-9_]+-linux-[a-z0-9_-]+$')
 
 
+@functools.lru_cache(maxsize=None)
+def _build_libc_header_skip() -> frozenset[str]:
+    """Return the set of C header paths always available without an explicit
+    Build-Depends entry, per Debian Policy §4.2.
+
+    ``libc6-dev`` and ``linux-libc-dev`` are part of build-essential and are
+    installed in every clean build environment (sbuild, pbuilder) without
+    needing to be listed in Build-Depends.  Any header they provide should
+    never drive a Build-Depends detection.
+
+    Multiarch install paths (``/usr/include/x86_64-linux-gnu/sys/stat.h``)
+    are normalised to their canonical form (``sys/stat.h``) by stripping the
+    arch-triplet directory segment so they match the bare header names that
+    ``scan_c_headers`` extracts from source files.
+
+    Results are cached after the first call.  Falls back to an empty set
+    gracefully if ``dpkg`` is unavailable (e.g. in CI without build-essential).
+    """
+    skip: set[str] = set()
+    prefix = "/usr/include/"
+    for pkg in ("libc6-dev", "linux-libc-dev"):
+        try:
+            result = subprocess.run(
+                ["dpkg", "-L", pkg],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            if not line.startswith(prefix) or not line.endswith(".h"):
+                continue
+            rel = line[len(prefix):]
+            # Normalise multiarch: x86_64-linux-gnu/sys/stat.h → sys/stat.h
+            parts = rel.split("/", 1)
+            if len(parts) == 2 and _ARCH_TRIPLET_RE.match(parts[0]):
+                rel = parts[1]
+            skip.add(rel)
+    return frozenset(skip)
+
+
 def _rank_header_candidates(
     candidates_with_paths: list[tuple[str, str]], header: str
 ) -> list[str]:
@@ -428,12 +482,14 @@ _PACKAGE_BLOCKLIST_EXACT = frozenset({
     "libgcc-dev",
     "gcc",
     "make",
+    "libnewlib-dev",    # ARM bare-metal C library; never a userspace Linux build-dep
 })
 
 # Corrections for packages commonly mis-selected by apt-file (e.g. 32-bit
 # variants returned instead of the canonical 64-bit -dev package)
 _PACKAGE_NAME_CORRECTIONS: dict[str, str] = {
     "lib32z1-dev": "zlib1g-dev",
+    "libldap-dev":  "libldap2-dev",   # Debian canonical name for OpenLDAP -dev
 }
 
 
@@ -444,16 +500,53 @@ def _is_blocked_package(pkg: str) -> bool:
     return any(pkg.startswith(p) for p in _PACKAGE_BLOCKLIST_PREFIXES)
 
 
-def _python_dedup(candidates: list[str]) -> list[str]:
+# ── PipelineLog — tracks decisions made during the detection pipeline ─────────
+
+@dataclass
+class PipelineLog:
+    """Captures every correction/removal decision made during detection.
+
+    Populated by _python_dedup, deduplicate_with_llm, and
+    _detect_competing_groups; consumed by detect() to build the
+    warnings section of the JSON output.
+    """
+    name_corrections: list[dict] = field(default_factory=list)
+    # [{from: str, to: str}]
+
+    blocklisted: list[dict] = field(default_factory=list)
+    # [{pkg: str, reason: str}]
+
+    dedup_removed: list[str] = field(default_factory=list)
+    # packages removed by the LLM dedup step (possible false negatives)
+
+    competing_groups: list[dict] = field(default_factory=list)
+    # [{namespace: str, packages: list[str], reason: str}]
+
+
+def _python_dedup(candidates: list[str],
+                  log: "PipelineLog | None" = None) -> list[str]:
     """
     Pure-Python deduplication: apply name corrections, remove blocked packages,
     and deduplicate.  Used as a pre-pass before (or as a fallback for) the LLM.
+
+    If *log* is provided, name corrections and blocked packages are recorded
+    there for inclusion in the warnings output.
     """
     seen: set[str] = set()
     result: list[str] = []
     for pkg in candidates:
-        pkg = _PACKAGE_NAME_CORRECTIONS.get(pkg, pkg)
+        corrected = _PACKAGE_NAME_CORRECTIONS.get(pkg, pkg)
+        if corrected != pkg and log is not None:
+            log.name_corrections.append({"from": pkg, "to": corrected})
+        pkg = corrected
         if _is_blocked_package(pkg):
+            if log is not None:
+                reason = (
+                    "always available via build-essential"
+                    if pkg in _PACKAGE_BLOCKLIST_EXACT
+                    else "platform/cross-compile package"
+                )
+                log.blocklisted.append({"pkg": pkg, "reason": reason})
             continue
         if pkg not in seen:
             seen.add(pkg)
@@ -461,11 +554,45 @@ def _python_dedup(candidates: list[str]) -> list[str]:
     return sorted(result)
 
 
-def resolve_c_headers(headers: set[str]) -> dict[str, list[str]]:
-    """Map each C header to candidate apt packages, ranked by canonical path."""
+def _collect_own_headers(source_dir: str) -> frozenset[str]:
+    """
+    Return the set of header paths (relative to the top-level include/ dir) that
+    exist in ``<source_dir>/include/``.
+
+    Only the direct ``include/`` child of the source root is scanned. Vendored
+    dependencies in subdirectories (``vendor/``, ``third_party/``, ``deps/``…)
+    are intentionally excluded — their headers must still resolve via apt-file.
+
+    For example, if ``<source_dir>/include/curl/curl.h`` exists, the returned
+    set contains ``curl/curl.h``.  resolve_c_headers() uses this to skip
+    self-provided headers so the package does not list itself as a build-dep.
+    """
+    include_dir = os.path.join(source_dir, "include")
+    if not os.path.isdir(include_dir):
+        return frozenset()
+
+    own: set[str] = set()
+    for walk_root, _, walk_files in os.walk(include_dir):
+        for fname in walk_files:
+            if os.path.splitext(fname)[1].lower() in C_EXTS or fname.endswith(".h"):
+                rel = os.path.relpath(os.path.join(walk_root, fname), include_dir)
+                own.add(rel)
+    return frozenset(own)
+
+
+def resolve_c_headers(headers: set[str], source_dir: str = "") -> dict[str, list[str]]:
+    """Map each C header to candidate apt packages, ranked by canonical path.
+
+    Headers that exist in the source tree's own include/ directories are skipped —
+    they are self-provided and do not require a separate -dev package.
+    """
+    own_headers = _collect_own_headers(source_dir) if source_dir else frozenset()
     results = {}
     total = len(headers)
     for i, header in enumerate(sorted(headers), 1):
+        if header in own_headers:
+            print(f"  [apt-file {i}/{total}] skipping self-provided: {header}", file=sys.stderr)
+            continue
         print(f"  [apt-file {i}/{total}] searching: {header}", file=sys.stderr)
         candidates_with_paths = _apt_file_search_with_paths(header)
         # Filter to -dev packages first
@@ -544,12 +671,23 @@ def _ask_item(description: str, candidates: list[str], llm_budget: dict) -> str 
 
 def resolve_with_llm(c_results: dict, py_results: dict,
                      go_modules: list[str], ac_results: dict,
-                     llm_budget: dict) -> list[str]:
+                     llm_budget: dict) -> tuple[list[str], dict[str, list[str]]]:
     """
     Call the LLM once per unique header/module/autoconf entry to select the best package.
-    Returns a raw (possibly duplicate) list of package names.
+
+    Returns:
+      - raw (possibly duplicate) list of package names
+      - pkg_to_headers: dict mapping each selected package to the headers that drove it
+        (used downstream for competing-group detection)
     """
-    collected = []
+    collected: list[str] = []
+    pkg_to_headers: dict[str, list[str]] = {}
+
+    # Build header→description mapping for pkg_to_headers tracking
+    header_for_item: dict[str, str] = {
+        f"C/C++ header <{h}>": h for h in c_results
+    }
+
     all_items = (
         [(f"C/C++ header <{h}>", pkgs) for h, pkgs in c_results.items()] +
         [(f"Python module '{m}'", pkgs) for m, pkgs in py_results.items()] +
@@ -563,8 +701,51 @@ def resolve_with_llm(c_results: dict, py_results: dict,
         pkg = _ask_item(description, candidates, llm_budget)
         if pkg:
             collected.append(pkg)
+            # Record which header drove this package selection
+            header = header_for_item.get(description)
+            if header:
+                pkg_to_headers.setdefault(pkg, []).append(header)
 
-    return collected
+    return collected, pkg_to_headers
+
+
+# ── Competing-implementations detection ───────────────────────────────────────
+
+def _detect_competing_groups(pkg_to_headers: dict[str, list[str]]) -> list[dict]:
+    """
+    Generically detect packages that are likely competing implementations of the
+    same library by examining header namespace prefixes.
+
+    Algorithm (no hardcoded library names):
+      1. For each detected package, extract the top-level directory prefix of every
+         header that drove it  (e.g. 'ngtcp2/ngtcp2_crypto_gnutls.h' → 'ngtcp2').
+         Headers with no directory prefix (e.g. 'libssl.h') are ignored here.
+      2. Build a map  namespace → set of packages  with that namespace.
+      3. Any namespace with 2+ distinct packages is flagged as a competing group —
+         the maintainer should keep only the variant that matches the build profile.
+    """
+    from collections import defaultdict
+    namespace_to_pkgs: dict[str, set[str]] = defaultdict(set)
+    for pkg, headers in pkg_to_headers.items():
+        for header in headers:
+            parts = header.split("/")
+            if len(parts) >= 2:
+                namespace = parts[0]
+                namespace_to_pkgs[namespace].add(pkg)
+
+    groups = []
+    for namespace, pkgs in namespace_to_pkgs.items():
+        if len(pkgs) >= 2:
+            groups.append({
+                "namespace": namespace,
+                "packages": sorted(pkgs),
+                "reason": (
+                    f"Multiple packages provide headers in the '{namespace}/' "
+                    "namespace — likely competing implementations. "
+                    "Keep only the variant matching your build profile."
+                ),
+            })
+    return groups
 
 
 # ── Final deduplication LLM call ──────────────────────────────────────────────
@@ -582,31 +763,44 @@ def _parse_json_list(text: str) -> list[str] | None:
     return None
 
 
-def deduplicate_with_llm(raw_deps: list[str]) -> list[str]:
+def deduplicate_with_llm(raw_deps: list[str],
+                         log: "PipelineLog | None" = None) -> list[str]:
     """
     Deduplicate the raw package list using a Python pre-pass followed by an
     optional LLM cleanup.
 
     Python pre-pass: applies name corrections, removes blocked/always-available
-    packages, and deduplicates.  The LLM then removes transitively-pulled and
-    redundant entries.  Falls back to the Python-only result if the LLM fails.
+    packages, and deduplicates.  The LLM then removes only clear non-starters
+    (cross-compile toolchains, doc packages, obvious non-Ubuntu package names).
+    Falls back to the Python-only result if the LLM fails.
+
+    NOTE: The LLM must NOT remove packages on the grounds that they may be
+    "pulled in transitively" — in Debian packaging, all direct build-time
+    dependencies must be listed explicitly in Build-Depends (Policy §7.7).
+
+    If *log* is provided, packages removed by the LLM step are recorded in
+    log.dedup_removed as possible false negatives.
     """
     # Python pre-pass: corrections + blocklist + exact dedup
-    candidates = _python_dedup([d for d in raw_deps if d and d.upper() != "SKIP"])
+    candidates = _python_dedup(
+        [d for d in raw_deps if d and d.upper() != "SKIP"], log=log
+    )
 
     if not candidates:
         return []
 
     user_prompt = (
-        "Below is a list of Ubuntu/Debian packages collected for Build-Depends. "
-        "Deduplicate and clean it:\n"
-        "  • Remove packages pulled in transitively by others in the list\n"
+        "Deduplicate and clean this list of Ubuntu/Debian packages for Build-Depends:\n"
+        "  • Remove exact duplicates\n"
         "  • Remove build-essential packages (gcc, make, libc6-dev, etc.)\n"
         "  • Remove cross-compilation toolchain packages (mingw, android, wine)\n"
-        "  • When multiple packages provide the same functionality, keep only the "
-        "primary/canonical one (e.g. if libssl-dev is listed alongside a higher-level "
-        "library that already depends on it, remove the redundant lower-level entry)\n"
-        "  • Keep only valid apt package names that belong in debian/control Build-Depends\n"
+        "  • Remove packages that are clearly not valid Ubuntu apt package names\n"
+        "  • Remove doc-only packages (e.g. ending in -doc)\n"
+        "  • Do NOT remove packages because they might be transitively provided — "
+        "Debian Policy §7.7 requires all direct build-time dependencies to be "
+        "listed explicitly in Build-Depends even if another listed package depends "
+        "on them at runtime\n"
+        "  • Keep all legitimate -dev packages even if they seem redundant\n"
         "Return ONLY a JSON array of the final package names.\n\n"
         f"Raw list: {json.dumps(candidates)}"
     )
@@ -616,6 +810,11 @@ def deduplicate_with_llm(raw_deps: list[str]) -> list[str]:
         if result:
             # Apply Python corrections to LLM output too
             result = _python_dedup(result)
+            if log is not None:
+                before_set = set(candidates)
+                after_set  = set(result)
+                removed = sorted(before_set - after_set)
+                log.dedup_removed.extend(removed)
             return sorted(result)
         print("  [~] Could not parse dedup JSON — using Python dedup result", file=sys.stderr)
     except RuntimeError as e:
@@ -650,7 +849,7 @@ def detect(source_dir: str, write: bool = False, backup: bool = False) -> dict:
         print(f"  [*] Build tools: {', '.join(build_tools)}", file=sys.stderr)
 
     # Phase 1a: resolve via apt-file (headers)
-    c_results  = resolve_c_headers(c_headers)  if c_headers  else {}
+    c_results  = resolve_c_headers(c_headers, source_dir)  if c_headers  else {}
     py_results = resolve_python_modules(py_modules) if py_modules else {}
 
     # Phase 1b: autoconf/CMake explicit library checks (much more precise)
@@ -667,14 +866,48 @@ def detect(source_dir: str, write: bool = False, backup: bool = False) -> dict:
     budget = llm_budget_seconds()
     print(f"  [*] Phase 2: asking AI per dependency ({total_items} items, budget: {int(budget)}s) ...", file=sys.stderr)
     llm_budget = {"remaining": budget}
-    raw_deps = resolve_with_llm(c_results, py_results, go_modules, ac_results, llm_budget)
+    log = PipelineLog()
+    raw_deps, pkg_to_headers = resolve_with_llm(
+        c_results, py_results, go_modules, ac_results, llm_budget
+    )
 
     # Add build system tools directly (no LLM needed — deterministic)
     raw_deps.extend(build_tools)
 
     # Phase 3: final deduplication LLM call
     print(f"  [*] Phase 3: deduplicating {len(raw_deps)} candidates ...", file=sys.stderr)
-    deps = deduplicate_with_llm(raw_deps)
+    deps = deduplicate_with_llm(raw_deps, log=log)
+
+    # Phase 4: build warnings from pipeline log
+    deduplicated_deps_set = set(deps)
+    competing_groups = _detect_competing_groups(pkg_to_headers)
+    log.competing_groups = []
+    for grp in competing_groups:
+        kept_packages = [pkg for pkg in grp["packages"] if pkg in deduplicated_deps_set]
+        if len(kept_packages) >= 2:
+            log.competing_groups.append({
+                "namespace": grp["namespace"],
+                "packages": kept_packages,
+                "reason": grp["reason"],
+            })
+
+    warnings: dict = {}
+    if log.dedup_removed:
+        warnings["possible_false_negatives"] = [
+            {"pkg": pkg,
+             "reason": "detected in source but removed during deduplication; verify manually"}
+            for pkg in log.dedup_removed
+        ]
+    if log.competing_groups:
+        warnings["possible_false_positives"] = [
+            {"pkg": pkg, "reason": grp["reason"]}
+            for grp in log.competing_groups
+            for pkg in grp["packages"]
+        ]
+    if log.name_corrections:
+        warnings["name_corrections"] = log.name_corrections
+    if log.blocklisted:
+        warnings["blocklisted"] = log.blocklisted
 
     written_to = None
     backed_up  = None
@@ -687,7 +920,8 @@ def detect(source_dir: str, write: bool = False, backup: bool = False) -> dict:
         written_to = _write_control(source_dir, deps)
 
     return {"status": "success", "dependencies": deps, "agent": "detective",
-            "written_to": written_to, "backed_up": backed_up}
+            "written_to": written_to, "backed_up": backed_up,
+            "data": {"build_depends": deps, "warnings": warnings}}
 
 
 # ── debian/control writer ─────────────────────────────────────────────────────

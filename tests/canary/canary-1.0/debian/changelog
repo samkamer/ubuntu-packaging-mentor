@@ -1,0 +1,6 @@
+canary (1.0-1) noble; urgency=medium
+
+  * Initial release — guardian validation canary package.
+    NOT FOR UPLOAD. Contains deliberate fake secrets for testing.
+
+ -- Guardian Test <guardian@example.com>  Fri, 15 May 2026 00:00:00 +0000

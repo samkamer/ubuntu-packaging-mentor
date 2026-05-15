@@ -1,7 +1,10 @@
 # tests/test_detective.py — unit tests for agents/detective.py
 import os
 import sys
+import tempfile
 import textwrap
+import subprocess
+import shutil
 
 import pytest
 
@@ -14,9 +17,29 @@ from agents.detective import (
     _rank_header_candidates,
     _is_blocked_package,
     _python_dedup,
+    _detect_competing_groups,
+    _collect_own_headers,
+    _build_libc_header_skip,
+    PipelineLog,
     scan_build_system,
     scan_autoconf_deps,
+    scan_c_headers,
+    detect,
 )
+
+
+def _has_installed_libc6_dev() -> bool:
+    if not shutil.which("dpkg-query"):
+        return False
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", "libc6-dev"],
+        capture_output=True,
+        text=True,
+    )
+    return (
+        result.returncode == 0
+        and "install ok installed" in result.stdout.lower()
+    )
 
 
 class TestIsStdlib:
@@ -273,3 +296,312 @@ class TestPythonDedup:
     def test_empty_input(self):
         assert _python_dedup([]) == []
 
+
+class TestPipelineLogIntegration:
+    """_python_dedup records corrections and blocklisted packages in PipelineLog."""
+
+    def test_logs_name_correction(self):
+        log = PipelineLog()
+        result = _python_dedup(["lib32z1-dev", "libssl-dev"], log=log)
+        assert result == ["libssl-dev", "zlib1g-dev"]
+        assert log.name_corrections == [{"from": "lib32z1-dev", "to": "zlib1g-dev"}]
+
+    def test_logs_blocklisted_exact(self):
+        log = PipelineLog()
+        _python_dedup(["libssl-dev", "libc6-dev"], log=log)
+        assert any(e["pkg"] == "libc6-dev" for e in log.blocklisted)
+
+    def test_logs_blocklisted_prefix(self):
+        log = PipelineLog()
+        _python_dedup(["libssl-dev", "android-liblog-dev"], log=log)
+        assert any(e["pkg"] == "android-liblog-dev" for e in log.blocklisted)
+
+    def test_logs_ldap_correction(self):
+        log = PipelineLog()
+        result = _python_dedup(["libldap-dev"], log=log)
+        assert result == ["libldap2-dev"]
+        assert log.name_corrections == [{"from": "libldap-dev", "to": "libldap2-dev"}]
+
+    def test_no_log_when_none(self):
+        # No crash when log is not provided
+        result = _python_dedup(["lib32z1-dev", "libc6-dev"])
+        assert "zlib1g-dev" in result
+        assert "libc6-dev" not in result
+
+    def test_libnewlib_blocklisted(self):
+        log = PipelineLog()
+        _python_dedup(["libnewlib-dev", "libssl-dev"], log=log)
+        assert any(e["pkg"] == "libnewlib-dev" for e in log.blocklisted)
+
+
+class TestDetectCompetingGroups:
+    """_detect_competing_groups flags multiple packages from the same header namespace."""
+
+    def test_single_package_per_namespace_not_flagged(self):
+        pkg_to_headers = {
+            "libssl-dev":    ["openssl/ssl.h", "openssl/crypto.h"],
+            "libnghttp2-dev": ["nghttp2/nghttp2.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert groups == []
+
+    def test_two_packages_same_namespace_flagged(self):
+        pkg_to_headers = {
+            "libngtcp2-dev":             ["ngtcp2/ngtcp2.h"],
+            "libngtcp2-crypto-gnutls-dev": ["ngtcp2/ngtcp2_crypto_gnutls.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert groups[0]["namespace"] == "ngtcp2"
+        assert set(groups[0]["packages"]) == {
+            "libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"
+        }
+
+    def test_three_packages_same_namespace(self):
+        pkg_to_headers = {
+            "pkg-a": ["crypto/a.h"],
+            "pkg-b": ["crypto/b.h"],
+            "pkg-c": ["crypto/c.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert len(groups[0]["packages"]) == 3
+
+    def test_flat_headers_no_namespace_ignored(self):
+        # Headers like 'libssl.h' (no dir prefix) don't contribute to namespace grouping
+        pkg_to_headers = {
+            "libssl-dev":  ["libssl.h"],
+            "libcurl-dev": ["libcurl.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert groups == []
+
+    def test_mixed_flat_and_namespaced(self):
+        pkg_to_headers = {
+            "libssl-dev":    ["libssl.h", "openssl/ssl.h"],
+            "libgnutls-dev": ["openssl/compat.h"],  # edge: same namespace, competing
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert len(groups) == 1
+        assert groups[0]["namespace"] == "openssl"
+
+    def test_empty_input(self):
+        assert _detect_competing_groups({}) == []
+
+    def test_reason_string_present(self):
+        pkg_to_headers = {
+            "pkg-a": ["tls/a.h"],
+            "pkg-b": ["tls/b.h"],
+        }
+        groups = _detect_competing_groups(pkg_to_headers)
+        assert "tls/" in groups[0]["reason"]
+        assert "competing" in groups[0]["reason"].lower()
+
+
+class TestDetectWarningFiltering:
+    def test_competing_warning_only_uses_packages_kept_in_final_deps(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agents.detective.shutil.which", lambda cmd: "/usr/bin/apt-file")
+        monkeypatch.setattr("agents.detective.scan_c_headers", lambda _: {"ngtcp2/ngtcp2.h"})
+        monkeypatch.setattr("agents.detective.scan_python_imports", lambda _: set())
+        monkeypatch.setattr("agents.detective.scan_go_modules", lambda _: set())
+        monkeypatch.setattr("agents.detective.scan_build_system", lambda _: [])
+        monkeypatch.setattr(
+            "agents.detective.resolve_c_headers",
+            lambda *_: {"ngtcp2/ngtcp2.h": ["libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"]},
+        )
+        monkeypatch.setattr("agents.detective.resolve_python_modules", lambda _: {})
+        monkeypatch.setattr("agents.detective.scan_autoconf_deps", lambda _: {})
+        monkeypatch.setattr(
+            "agents.detective.resolve_with_llm",
+            lambda *_: (
+                ["libngtcp2-dev", "libngtcp2-crypto-gnutls-dev"],
+                {
+                    "libngtcp2-dev": ["ngtcp2/ngtcp2.h"],
+                    "libngtcp2-crypto-gnutls-dev": ["ngtcp2/ngtcp2_crypto_gnutls.h"],
+                },
+            ),
+        )
+        monkeypatch.setattr("agents.detective.deduplicate_with_llm", lambda *_, **__: ["libngtcp2-dev"])
+
+        result = detect(str(tmp_path))
+
+        assert result["status"] == "success"
+        warnings = result["data"]["warnings"]
+        assert "possible_false_positives" not in warnings
+
+
+class TestCollectOwnHeaders:
+    """_collect_own_headers returns headers under <source_dir>/include/ only."""
+
+    def test_finds_headers_in_include_dir(self, tmp_path):
+        include = tmp_path / "include" / "mylib"
+        include.mkdir(parents=True)
+        (include / "mylib.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "mylib/mylib.h" in own
+
+    def test_top_level_header_in_include(self, tmp_path):
+        include = tmp_path / "include"
+        include.mkdir()
+        (include / "toplevel.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "toplevel.h" in own
+
+    def test_no_include_dir_returns_empty(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "main.c").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert len(own) == 0
+
+    def test_vendored_subdir_include_not_collected(self, tmp_path):
+        # Headers inside vendor/ subdirs must NOT be collected — they still
+        # need apt-file resolution.
+        vendor_include = tmp_path / "vendor" / "openssl" / "include" / "openssl"
+        vendor_include.mkdir(parents=True)
+        (vendor_include / "ssl.h").write_text("")
+        own = _collect_own_headers(str(tmp_path))
+        assert "openssl/ssl.h" not in own
+
+    def test_returns_frozenset(self, tmp_path):
+        own = _collect_own_headers(str(tmp_path))
+        assert isinstance(own, frozenset)
+
+
+class TestPlatformSkipNewHeaders:
+    """iconv.h and netdb.h are now in _PLATFORM_SKIP."""
+
+    def test_iconv_is_skipped(self):
+        assert _PLATFORM_SKIP.match("iconv.h")
+
+    def test_netdb_is_skipped(self):
+        assert _PLATFORM_SKIP.match("netdb.h")
+
+    def test_libssl_not_skipped(self):
+        assert not _PLATFORM_SKIP.match("openssl/ssl.h")
+
+    def test_brotli_not_skipped(self):
+        assert not _PLATFORM_SKIP.match("brotli/decode.h")
+
+
+class TestBuildLibcHeaderSkip:
+    """Tests for _build_libc_header_skip() — dynamic build-essential header set."""
+
+    def test_returns_frozenset(self):
+        result = _build_libc_header_skip()
+        assert isinstance(result, frozenset)
+
+    def test_mocked_direct_path(self, monkeypatch):
+        """Direct /usr/include/<header> paths are stored as-is."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = "/usr/include/stdio.h\n/usr/include/malloc.h\n/usr/share/doc/libc6-dev/README\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert "stdio.h" in result
+        assert "malloc.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_mocked_multiarch_path_normalised(self, monkeypatch):
+        """Multiarch paths like /usr/include/x86_64-linux-gnu/sys/stat.h → sys/stat.h."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = (
+            "/usr/include/x86_64-linux-gnu/sys/stat.h\n"
+            "/usr/include/x86_64-linux-gnu/sys/types.h\n"
+            "/usr/include/x86_64-linux-gnu/sys/auxv.h\n"
+        )
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert "sys/stat.h" in result
+        assert "sys/types.h" in result
+        assert "sys/auxv.h" in result
+        # Raw multiarch form must NOT be stored
+        assert "x86_64-linux-gnu/sys/stat.h" not in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_non_include_paths_ignored(self, monkeypatch):
+        """Lines outside /usr/include/ are not added."""
+        _build_libc_header_skip.cache_clear()
+        mock_output = "/usr/lib/libc.a\n/usr/share/man/man3/malloc.3.gz\n"
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": mock_output})())
+        result = _build_libc_header_skip()
+        assert len(result) == 0
+        _build_libc_header_skip.cache_clear()
+
+    def test_dpkg_missing_returns_empty(self, monkeypatch):
+        """If dpkg is not found, return empty set (graceful fallback)."""
+        _build_libc_header_skip.cache_clear()
+        import subprocess as sp
+        def raise_fnf(*a, **kw):
+            raise FileNotFoundError("dpkg not found")
+        monkeypatch.setattr("subprocess.run", raise_fnf)
+        result = _build_libc_header_skip()
+        assert result == frozenset()
+        _build_libc_header_skip.cache_clear()
+
+    def test_dpkg_failure_returns_empty(self, monkeypatch):
+        """If dpkg exits non-zero, that package is skipped gracefully."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
+        result = _build_libc_header_skip()
+        assert result == frozenset()
+        _build_libc_header_skip.cache_clear()
+
+    @pytest.mark.skipif(
+        not shutil.which("dpkg") or not _has_installed_libc6_dev(),
+        reason="dpkg/libc6-dev not available",
+    )
+    def test_real_glibc_headers_present(self):
+        """Live integration: real libc6-dev headers are in the skip set."""
+        _build_libc_header_skip.cache_clear()
+        result = _build_libc_header_skip()
+        # These are always in libc6-dev (multiarch-normalised)
+        assert "sys/stat.h" in result
+        assert "sys/types.h" in result
+        assert "malloc.h" in result
+
+    @pytest.mark.skipif(
+        not shutil.which("dpkg") or not _has_installed_libc6_dev(),
+        reason="dpkg/libc6-dev not available",
+    )
+    def test_systemtap_sdt_not_in_libc_skip(self):
+        """sys/sdt.h is from systemtap-sdt-dev (not build-essential) — must NOT be skipped."""
+        _build_libc_header_skip.cache_clear()
+        result = _build_libc_header_skip()
+        assert "sys/sdt.h" not in result
+
+
+class TestScanCHeadersLibcFilter:
+    """Tests that scan_c_headers respects the libc/build-essential skip set."""
+
+    def test_libc_header_filtered_out(self, monkeypatch, tmp_path):
+        """A header in the libc skip set should not appear in scan output."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset({"sys/stat.h"}))
+        src = tmp_path / "foo.c"
+        src.write_text('#include <sys/stat.h>\n#include <zlib.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "sys/stat.h" not in result
+        assert "zlib.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_non_libc_header_kept(self, monkeypatch, tmp_path):
+        """A header NOT in the libc skip set should still be returned."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset({"sys/stat.h"}))
+        src = tmp_path / "bar.c"
+        src.write_text('#include <openssl/ssl.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "openssl/ssl.h" in result
+        _build_libc_header_skip.cache_clear()
+
+    def test_anchored_regex_ignores_inline_comment(self, monkeypatch, tmp_path):
+        """Regex is anchored: #include inside a comment should not be picked up."""
+        _build_libc_header_skip.cache_clear()
+        monkeypatch.setattr("agents.detective._build_libc_header_skip", lambda: frozenset())
+        src = tmp_path / "baz.c"
+        # A comment containing the word #include must not match
+        src.write_text('/* see also #include <fake.h> */\n#include <real.h>\n')
+        result = scan_c_headers(str(tmp_path))
+        assert "fake.h" not in result
+        assert "real.h" in result
+        _build_libc_header_skip.cache_clear()

@@ -75,6 +75,33 @@ _ERROR_CATEGORIES = {
 
 LOG_TAIL_LINES = 20
 
+# Subdirectory under lab/builds/ where build artefacts are stored
+_LAB_BUILDS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "lab", "builds",
+)
+
+
+def _save_build_log(source_dir: str, log_content: str) -> str | None:
+    """
+    Persist the full debuild log to lab/builds/<pkg_name>/build.log.
+
+    Returns the saved path on success, or None on failure (non-fatal).
+    The log is always written regardless of build success/failure so that
+    guardian.py can perform a hardening audit on both outcomes.
+    """
+    pkg_name = os.path.basename(os.path.abspath(source_dir))
+    build_dir = os.path.join(_LAB_BUILDS_DIR, pkg_name)
+    try:
+        os.makedirs(build_dir, exist_ok=True)
+        log_path = os.path.join(build_dir, "build.log")
+        with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(log_content)
+        return log_path
+    except OSError as exc:
+        print(f"  [~] Could not save build log: {exc}", file=sys.stderr)
+        return None
+
 
 # ── Build runner ───────────────────────────────────────────────────────────────
 
@@ -284,6 +311,11 @@ def build(source_dir: str) -> dict:
     log_lines = full_log.splitlines()
     log_tail  = "\n".join(log_lines[-LOG_TAIL_LINES:])
 
+    # Persist the full log regardless of build outcome so that guardian.py
+    # can perform a hardening audit on successful builds and the log is
+    # available for post-mortem analysis on failures.
+    log_path = _save_build_log(source_dir, full_log)
+
     if returncode == 0:
         print("  [✓] Build succeeded", file=sys.stderr)
         changes_file = _find_changes_file(source_dir, full_log)
@@ -296,11 +328,12 @@ def build(source_dir: str) -> dict:
                   file=sys.stderr)
 
         base = {
-            "status":    "success",
-            "message":   "Package built successfully.",
-            "agent":     "builder",
-            "log_lines": len(log_lines),
-            "lintian":   lintian_result,
+            "status":          "success",
+            "message":         "Package built successfully.",
+            "agent":           "builder",
+            "log_lines":       len(log_lines),
+            "build_log_path":  log_path,
+            "lintian":         lintian_result,
         }
 
         # Lintian errors flip the overall status but use a distinct error_type
@@ -337,6 +370,7 @@ def build(source_dir: str) -> dict:
         "suggested_agent":   analysis["suggested_agent"],
         "suggested_command": analysis["suggested_command"],
         "log_tail":          log_tail,
+        "build_log_path":    log_path,
     }
 
 
