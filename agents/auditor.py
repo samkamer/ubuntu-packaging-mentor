@@ -243,22 +243,29 @@ def group_by_license(entries: list[dict], llm_budget: dict) -> dict:
     total = len(unique_licenses)
     print(f"  Normalising {total} unique license string(s) ...", file=sys.stderr)
 
-    # Normalise each unique license string once
+    # Normalise each unique license string once.
+    # Track whether the raw string used 'and/or' — that signals ambiguity about
+    # whether the compound expression is alternative (or) or simultaneous (and).
     cache = {}
     for i, raw in enumerate(unique_licenses, 1):
         label = f"  [{i}/{total}] {raw[:60]}"
         dep5_id = reason_license(raw, llm_budget)
-        method = "llm" if llm_budget["remaining"] > 0 else "regex"
+        ambiguous = bool(re.search(r"\band/or\b", raw, re.IGNORECASE))
         print(f"{label} → {dep5_id}", file=sys.stderr)
-        cache[raw] = dep5_id
+        cache[raw] = (dep5_id, ambiguous)
 
     # Group files
     groups: dict = {}
     for entry in entries:
-        dep5_id = cache[entry["license"]]
+        dep5_id, ambiguous = cache[entry["license"]]
         key = (dep5_id, frozenset(entry["copyrights"]))
         if key not in groups:
-            groups[key] = {"files": [], "license": dep5_id, "copyrights": entry["copyrights"]}
+            groups[key] = {
+                "files":      [],
+                "license":    dep5_id,
+                "copyrights": entry["copyrights"],
+                "ambiguous":  ambiguous,
+            }
         groups[key]["files"].append(entry["file"])
 
     return groups
@@ -287,6 +294,14 @@ def build_dep5(groups: dict, source_name: str) -> str:
         lines.append(f"Files: {files_glob}")
         for cp in copyrights:
             lines.append(f"Copyright: {cp}")
+        # If licensecheck used 'and/or', we defaulted to 'or' (alternative licenses).
+        # Add a FIXME so the maintainer can verify — change to 'and' if both licenses
+        # apply simultaneously rather than as a choice.
+        if info.get("ambiguous"):
+            lines.append(
+                "# FIXME: licensecheck reported 'and/or' — using 'or' (either license "
+                "may be chosen). Change to 'and' if both licenses apply simultaneously."
+            )
         lines.append(f"License: {dep5_id}")
         lines.append("")
 

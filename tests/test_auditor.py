@@ -141,12 +141,13 @@ class TestParseLicensecheckOutput:
 
 
 class TestBuildDep5:
-    def _make_groups(self):
+    def _make_groups(self, ambiguous=False):
         return {
             ("MIT", frozenset(["2024 Alice"])): {
                 "files": ["./src/foo.c"],
                 "license": "MIT",
                 "copyrights": ["2024 Alice"],
+                "ambiguous": ambiguous,
             },
         }
 
@@ -169,3 +170,21 @@ class TestBuildDep5:
     def test_contains_files_line(self):
         dep5 = build_dep5(self._make_groups(), "mypkg")
         assert "Files:" in dep5
+
+    def test_no_fixme_comment_when_unambiguous(self):
+        dep5 = build_dep5(self._make_groups(ambiguous=False), "mypkg")
+        assert "FIXME" not in dep5 or "and/or" not in dep5
+
+    def test_fixme_comment_when_ambiguous(self):
+        groups = {
+            ("ISC or curl", frozenset(["2024 Alice"])): {
+                "files": ["./src/foo.c"],
+                "license": "ISC or curl",
+                "copyrights": ["2024 Alice"],
+                "ambiguous": True,
+            },
+        }
+        dep5 = build_dep5(groups, "mypkg")
+        assert "FIXME" in dep5
+        assert "and/or" in dep5
+        assert "License: ISC or curl" in dep5
