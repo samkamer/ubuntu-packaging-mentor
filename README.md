@@ -137,6 +137,21 @@ asciinema play demo/demo.cast
 asciinema play demo/demo_personas.cast
 ```
 
+`demo/run_demo_personas.py` is a scripted walkthrough that drives `mentor.py`
+non-interactively via `pexpect` to show how the same tool adapts its output to
+three experience levels in one session. To re-run it live:
+
+```bash
+pip install pexpect
+AI_PROVIDER=demo python3 demo/run_demo_personas.py
+```
+
+To re-record the asciinema cast:
+
+```bash
+bash demo/record_personas.sh
+```
+
 ---
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture, agent API contracts,
