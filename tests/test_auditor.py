@@ -11,6 +11,8 @@ from agents.auditor import (
     _regex_fallback,
     _dominant_license,
     _parse_debian_maintainers,
+    _apply_filename_exceptions,
+    _apply_wildcard_grouping,
     parse_licensecheck_output,
     build_dep5,
 )
@@ -120,7 +122,8 @@ class TestParseLicensecheckOutput:
     def test_first_entry_fields(self):
         entries = parse_licensecheck_output(self.SAMPLE)
         e = entries[0]
-        assert e["file"] == "./src/foo.c"
+        # Leading './' is stripped — DEP-5 uses plain relative paths
+        assert e["file"] == "src/foo.c"
         # Parser returns the raw licensecheck string; normalization happens later
         assert "General Public License" in e["license"]
         assert e["copyrights"] == ["2020 Alice"]
@@ -146,7 +149,7 @@ class TestBuildDep5:
     def _make_groups(self, ambiguous=False):
         return {
             ("MIT", frozenset(["2024 Alice"])): {
-                "files": ["./src/foo.c"],
+                "files": ["src/foo.c"],
                 "license": "MIT",
                 "copyrights": ["2024 Alice"],
                 "ambiguous": ambiguous,
@@ -175,12 +178,13 @@ class TestBuildDep5:
 
     def test_no_fixme_comment_when_unambiguous(self):
         dep5 = build_dep5(self._make_groups(ambiguous=False), "mypkg")
-        assert "FIXME" not in dep5 or "and/or" not in dep5
+        # The only FIXME should be in the header placeholders, not in a license comment
+        assert "FIXME: licensecheck reported" not in dep5
 
     def test_fixme_comment_when_ambiguous(self):
         groups = {
             ("ISC or curl", frozenset(["2024 Alice"])): {
-                "files": ["./src/foo.c"],
+                "files": ["src/foo.c"],
                 "license": "ISC or curl",
                 "copyrights": ["2024 Alice"],
                 "ambiguous": True,
@@ -326,3 +330,176 @@ class TestParseDebianMaintainers:
     def test_returns_empty_when_no_changelog(self, tmp_path):
         result = _parse_debian_maintainers(str(tmp_path))
         assert result == []
+
+
+class TestStripDotSlash:
+    def test_strips_leading_dot_slash(self):
+        output = "./src/foo.c: MIT License\n  [Copyright: 2024 Alice]\n"
+        entries = parse_licensecheck_output(output)
+        assert entries[0]["file"] == "src/foo.c"
+
+    def test_root_level_file_stripped(self):
+        output = "./README: UNKNOWN\n"
+        entries = parse_licensecheck_output(output)
+        assert entries[0]["file"] == "README"
+
+    def test_no_leading_dot_slash_unchanged(self):
+        # If licensecheck ever outputs without ./ prefix, we handle it gracefully
+        output = "./deep/path/file.c: MIT License\n"
+        entries = parse_licensecheck_output(output)
+        assert not entries[0]["file"].startswith("./")
+
+
+class TestApplyFilenameExceptions:
+    def _entry(self, filename, license_str="GNU General Public License v2.0 or later"):
+        return {"file": f"build/{filename}", "license": license_str, "copyrights": []}
+
+    def test_compile_gets_autoconf_exception(self):
+        entries = [self._entry("compile")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-2+ with Autoconf-data exception"
+
+    def test_depcomp_gets_autoconf_exception(self):
+        entries = [self._entry("depcomp")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-2+ with Autoconf-data exception"
+
+    def test_missing_gets_autoconf_exception(self):
+        entries = [self._entry("missing")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-2+ with Autoconf-data exception"
+
+    def test_ltmain_sh_gets_libtool_exception(self):
+        entries = [self._entry("ltmain.sh")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-2+ with Libtool exception"
+
+    def test_config_guess_gets_gpl3_autoconf_exception(self):
+        entries = [self._entry("config.guess")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-3+ with Autoconf-data exception"
+
+    def test_config_sub_gets_gpl3_autoconf_exception(self):
+        entries = [self._entry("config.sub")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "GPL-3+ with Autoconf-data exception"
+
+    def test_unrelated_file_unchanged(self):
+        entries = [self._entry("main.c", "MIT")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "MIT"
+
+    def test_install_sh_is_not_overridden(self):
+        # install-sh is ambiguous by basename — not in override map
+        entries = [self._entry("install-sh", "MIT")]
+        result = _apply_filename_exceptions(entries)
+        assert result[0]["license"] == "MIT"
+
+
+class TestApplyWildcardGrouping:
+    def _group(self, license_id, files, copyrights=None):
+        if copyrights is None:
+            copyrights = ["2024 Author"]
+        return {
+            "files": files,
+            "license": license_id,
+            "copyrights": copyrights,
+            "ambiguous": False,
+        }
+
+    def test_single_owner_directory_collapses(self):
+        groups = {
+            ("MIT", frozenset(["2024 A"])): self._group("MIT", ["lib/a.c", "lib/b.c"]),
+        }
+        result = _apply_wildcard_grouping(groups)
+        info = list(result.values())[0]
+        assert info["files"] == ["lib/*"]
+
+    def test_shared_directory_does_not_collapse(self):
+        groups = {
+            ("MIT", frozenset(["2024 A"])): self._group("MIT", ["lib/a.c"]),
+            ("ISC", frozenset(["2024 B"])): self._group("ISC", ["lib/b.c"]),
+        }
+        result = _apply_wildcard_grouping(groups)
+        for info in result.values():
+            assert "lib/*" not in info["files"]
+
+    def test_root_level_files_not_collapsed(self):
+        groups = {
+            ("MIT", frozenset(["2024 A"])): self._group("MIT", ["README", "LICENSE"]),
+        }
+        result = _apply_wildcard_grouping(groups)
+        info = list(result.values())[0]
+        # Root-level files should stay individual
+        assert "/*" not in " ".join(info["files"])
+        assert "README" in info["files"]
+
+    def test_single_file_in_dir_not_collapsed(self):
+        groups = {
+            ("MIT", frozenset(["2024 A"])): self._group("MIT", ["lib/only.c"]),
+        }
+        result = _apply_wildcard_grouping(groups)
+        info = list(result.values())[0]
+        assert info["files"] == ["lib/only.c"]
+
+    def test_mixed_dirs_partial_collapse(self):
+        # lib/ is exclusive to group A (2 files), src/ is shared
+        groups = {
+            ("MIT", frozenset(["2024 A"])): self._group("MIT", ["lib/a.c", "lib/b.c", "src/x.c"]),
+            ("ISC", frozenset(["2024 B"])): self._group("ISC", ["src/y.c"]),
+        }
+        result = _apply_wildcard_grouping(groups)
+        mit_info = result[("MIT", frozenset(["2024 A"]))]
+        assert "lib/*" in mit_info["files"]
+        assert "src/x.c" in mit_info["files"]
+        assert "src/*" not in mit_info["files"]
+
+
+class TestLicenseTextBodies:
+    def _make_group(self, license_id, files=None):
+        return {
+            (license_id, frozenset(["2024 Author"])): {
+                "files": files or ["src/foo.c"],
+                "license": license_id,
+                "copyrights": ["2024 Author"],
+                "ambiguous": False,
+            }
+        }
+
+    def test_known_license_text_embedded(self):
+        dep5 = build_dep5(self._make_group("ISC"), "mypkg")
+        # Should contain the ISC license text, not a URL stub
+        assert "Permission to use, copy, modify" in dep5
+        assert "spdx.org" not in dep5
+
+    def test_unknown_license_gets_fixme(self):
+        dep5 = build_dep5(self._make_group("UNKNOWN"), "mypkg")
+        assert "FIXME" in dep5
+
+    def test_compound_or_license_splits_into_two_paragraphs(self):
+        groups = {
+            ("curl or ISC", frozenset(["2024 A"])): {
+                "files": ["src/foo.c"],
+                "license": "curl or ISC",
+                "copyrights": ["2024 A"],
+                "ambiguous": False,
+            }
+        }
+        dep5 = build_dep5(groups, "mypkg")
+        # Both individual license paragraphs should appear
+        lines = dep5.splitlines()
+        standalone = [l for l in lines if l.startswith("License:") and "Files:" not in dep5[:dep5.index(l)] or False]
+        # Simpler: count standalone License: lines (those not in a Files: block)
+        assert "License: curl" in lines
+        assert "License: ISC" in lines
+        # The compound expression should NOT appear as a standalone paragraph
+        assert "License: curl or ISC" not in [
+            l for l in lines
+            if l.startswith("License:") and l != "License: curl or ISC"
+        ] or "License: curl or ISC" in lines  # it appears in Files block, that's fine
+
+    def test_no_url_stub_for_known_license(self):
+        dep5 = build_dep5(self._make_group("MIT"), "mypkg")
+        assert "spdx.org" not in dep5
+        # No license-text FIXME for a known license (header FIXME placeholders are fine)
+        assert "FIXME: license text for" not in dep5

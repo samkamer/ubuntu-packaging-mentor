@@ -30,6 +30,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.brain import ask, llm_budget_seconds, backup_file
+from agents.license_texts import LICENSE_TEXTS
 
 # ── DEP-5 / SPDX known identifiers ───────────────────────────────────────────
 
@@ -105,8 +106,11 @@ def parse_licensecheck_output(output: str) -> list[dict]:
         if file_match:
             if current:
                 entries.append(current)
+            # Strip leading './' — DEP-5 uses plain relative paths
+            raw_path = file_match.group(1)
+            clean_path = raw_path[2:] if raw_path.startswith("./") else raw_path
             current = {
-                "file": file_match.group(1),
+                "file": clean_path,
                 "license": file_match.group(2).strip(),
                 "copyrights": [],
             }
@@ -271,7 +275,88 @@ def group_by_license(entries: list[dict], llm_budget: dict) -> dict:
     return groups
 
 
-# ── Catch-all and debian/* helpers ───────────────────────────────────────────
+# ── Filename-based license exception overrides ───────────────────────────────
+# licensecheck does not emit exception clauses for GNU build-system files.
+# These are well-known files where the exception is part of the canonical license.
+# Keys are basenames; values are the correct DEP-5 identifier.
+_FILENAME_EXCEPTION_OVERRIDES: dict[str, str] = {
+    "compile":      "GPL-2+ with Autoconf-data exception",
+    "depcomp":      "GPL-2+ with Autoconf-data exception",
+    "missing":      "GPL-2+ with Autoconf-data exception",
+    "ltmain.sh":    "GPL-2+ with Libtool exception",
+    "config.guess": "GPL-3+ with Autoconf-data exception",
+    "config.sub":   "GPL-3+ with Autoconf-data exception",
+}
+
+
+def _apply_filename_exceptions(entries: list[dict]) -> list[dict]:
+    """
+    Override the raw license string for known GNU build-system files where
+    licensecheck omits the GPL exception clause.
+    """
+    for entry in entries:
+        basename = os.path.basename(entry["file"])
+        if basename in _FILENAME_EXCEPTION_OVERRIDES:
+            entry["license"] = _FILENAME_EXCEPTION_OVERRIDES[basename]
+    return entries
+
+
+# ── Wildcard grouping ─────────────────────────────────────────────────────────
+
+def _apply_wildcard_grouping(groups: dict) -> dict:
+    """
+    Replace lists of individual file paths with directory glob patterns where safe.
+
+    A directory can be collapsed to 'dir/*' only when EVERY file whose immediate
+    parent directory is 'dir' belongs to the same (license, copyright) group AND
+    there are at least two such files.  DEP-5 uses Python fnmatch semantics where
+    '*' does NOT cross '/', so 'dir/*' covers only direct children.
+
+    Root-level files (dirname == '') are always listed individually.
+    """
+    # Build: dir -> list of all files (across all groups) in that directory
+    all_dir_files: dict[str, list[str]] = {}
+    for info in groups.values():
+        for f in info["files"]:
+            d = os.path.dirname(f)
+            all_dir_files.setdefault(d, []).append(f)
+
+    # Build: file -> group key
+    file_to_key: dict[str, tuple] = {}
+    for key, info in groups.items():
+        for f in info["files"]:
+            file_to_key[f] = key
+
+    # For each group, compute its final file/glob list
+    new_groups: dict = {}
+    for key, info in groups.items():
+        # Group this group's files by immediate parent directory
+        dir_files_in_group: dict[str, list[str]] = {}
+        for f in info["files"]:
+            d = os.path.dirname(f)
+            dir_files_in_group.setdefault(d, []).append(f)
+
+        result_globs: list[str] = []
+        for d, group_files in dir_files_in_group.items():
+            all_in_dir = all_dir_files.get(d, [])
+            can_collapse = (
+                d != ""                                  # never collapse root
+                and len(group_files) >= 2                # at least 2 files
+                and set(group_files) == set(all_in_dir)  # every file in dir is ours
+            )
+            if can_collapse:
+                result_globs.append(f"{d}/*")
+            else:
+                result_globs.extend(sorted(group_files))
+
+        new_info = dict(info)
+        new_info["files"] = sorted(result_globs)
+        new_groups[key] = new_info
+
+    return new_groups
+
+
+
 
 def _dominant_license(groups: dict) -> tuple[str, list[str]]:
     """
@@ -393,13 +478,23 @@ def build_dep5(groups: dict, source_name: str, source_dir: str = "") -> str:
         lines.append(f"License: {dep5_id}")
         lines.append("")
 
-        if dep5_id not in seen_licenses:
-            seen_licenses.append(dep5_id)
+        # Collect atomic license tokens for standalone paragraphs.
+        # Split compound 'X or Y' / 'X and Y' expressions; keep 'with exception' intact.
+        for token in re.split(r"\s+(?:or|and)\s+(?!later\b)", dep5_id):
+            token = token.strip()
+            if token and token not in seen_licenses:
+                seen_licenses.append(token)
 
     for dep5_id in seen_licenses:
         lines.append(f"License: {dep5_id}")
-        lines.append(f" Full license text available at:")
-        lines.append(f" https://spdx.org/licenses/{dep5_id}.html")
+        if dep5_id in LICENSE_TEXTS:
+            lines.append(LICENSE_TEXTS[dep5_id])
+        else:
+            lines.append(
+                f" FIXME: license text for '{dep5_id}' not found in the embedded"
+                " library — please add the full license text here, indented by one"
+                " space, with blank lines replaced by ' .'."
+            )
         lines.append("")
 
     return "\n".join(lines)
@@ -429,11 +524,14 @@ def audit(source_dir: str, write: bool = False, backup: bool = False) -> dict:
         return {"status": "error", "data": None, "agent": "auditor",
                 "error": "No license/copyright information found in source tree."}
 
+    entries = _apply_filename_exceptions(entries)
+
     print(f"  [*] Found {len(entries)} file(s). Resolving license identifiers ...", file=sys.stderr)
     budget = llm_budget_seconds()
     print(f"  [*] LLM budget: {int(budget)}s (set LLM_BUDGET env var to change)", file=sys.stderr)
     llm_budget = {"remaining": budget}
     groups = group_by_license(entries, llm_budget)
+    groups = _apply_wildcard_grouping(groups)
 
     dep5_text = build_dep5(groups, source_name, source_dir)
 
